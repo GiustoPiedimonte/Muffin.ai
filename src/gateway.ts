@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { getHistory, saveMessages, type Message } from "./memory/memory_messages.js";
 import { checkExplicitMemory, saveExplicitFact } from "./memory/memory_semantic.js";
 import { getRelevantContext } from "./memory/memory_retrieval.js";
+import { getCachedRelevantContext } from "./memory/memory_cache.js";
 import { processLearnings, formatLearningResponse, handlePendingConfirmation } from "./memory/memory_learning.js";
 import { saveEpisode } from "./memory/memory_episodic.js";
 import { logAction } from "./logger.js";
@@ -50,10 +51,17 @@ async function callClaude(
     history: Message[],
     userMessage: string,
     chatId: string
-): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
+): Promise<{ text: string; inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number; model: string }> {
     const client = getClaude();
     const basePrompt = loadSystemPrompt();
-    const memoryContext = await getRelevantContext(chatId, userMessage);
+    
+    // Use cached context instead of direct call
+    const memoryContext = await getCachedRelevantContext(
+        chatId,
+        userMessage,
+        getRelevantContext
+    );
+    
     const system = basePrompt + memoryContext;
 
     const routerDecision = selectModel(userMessage, history, system.length);
@@ -77,13 +85,21 @@ async function callClaude(
     let response = await client.messages.create({
         model: MODEL,
         max_tokens: 4096,
-        system,
+        system: [
+            {
+                type: "text",
+                text: system,
+                cache_control: { type: "ephemeral" }
+            }
+        ],
         tools: allToolDefinitions,
         messages,
     });
 
     let totalInput = response.usage.input_tokens;
     let totalOutput = response.usage.output_tokens;
+    let cacheCreationTokens = response.usage.cache_creation_input_tokens || 0;
+    let cacheReadTokens = response.usage.cache_read_input_tokens || 0;
 
     // Tool-use loop
     while (response.stop_reason === "tool_use") {
@@ -111,20 +127,28 @@ async function callClaude(
         response = await client.messages.create({
             model: MODEL,
             max_tokens: 4096,
-            system,
+            system: [
+                {
+                    type: "text",
+                    text: system,
+                    cache_control: { type: "ephemeral" }
+                }
+            ],
             tools: allToolDefinitions,
             messages,
         });
 
         totalInput += response.usage.input_tokens;
         totalOutput += response.usage.output_tokens;
+        cacheCreationTokens += response.usage.cache_creation_input_tokens || 0;
+        cacheReadTokens += response.usage.cache_read_input_tokens || 0;
     }
 
     const textBlocks = response.content.filter(
         (b): b is Anthropic.TextBlock => b.type === "text"
     );
     const text = textBlocks.map((b) => b.text).join("\n");
-    return { text, inputTokens: totalInput, outputTokens: totalOutput };
+    return { text, inputTokens: totalInput, outputTokens: totalOutput, cacheCreationTokens, cacheReadTokens, model: MODEL };
 }
 
 // ---------------------------------------------------------------------------
@@ -166,10 +190,15 @@ export async function processMessage(chatId: string, userText: string): Promise<
 
     // 3. Load history & generate response via Claude
     const history = await getHistory(chatId);
-    const { text: reply, inputTokens, outputTokens } = await enqueue(() => callClaude(history, userText, chatId));
+    const { text: reply, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, model } = await enqueue(() => callClaude(history, userText, chatId));
 
-    const totalTokens = inputTokens + outputTokens;
-    const tokenFooter = `\n\n> \`(${totalTokens}/${inputTokens}/${outputTokens})\``;
+    const totalTokens = inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens;
+    const modelInitial = model.includes("haiku") ? "H" : model.includes("sonnet") ? "S" : "?";
+    const fmtK = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(n);
+    const cacheStr = cacheReadTokens > 0 || cacheCreationTokens > 0
+        ? ` | C:${fmtK(cacheReadTokens)}`
+        : "";
+    const tokenFooter = `\n\n> \`[ ${modelInitial} | T:${fmtK(totalTokens)} | I:${fmtK(inputTokens)} | O:${fmtK(outputTokens)}${cacheStr} ]\``;
 
     // 4. Save to Conversational Memory
     await saveMessages(chatId, [

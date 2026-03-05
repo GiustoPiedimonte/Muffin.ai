@@ -1,5 +1,7 @@
 import { Telegraf, Input } from "telegraf";
+import { toTelegramHTML } from "./utils/format.js";
 import { runBatch } from "./memory/memory_semantic.js";
+import { buildMemoryDebugReport } from "./memory/memory_debug.js";
 import { logAction } from "./logger.js";
 import { processMessage } from "./gateway.js";
 
@@ -52,6 +54,25 @@ export function startBot(): Telegraf {
         }
     });
 
+    // /debug_memory command — dump full memory state as .md file
+    bot.command("debug_memory", async (ctx) => {
+        const chatIdStr = String(ctx.chat.id);
+
+        try {
+            await ctx.sendChatAction("typing");
+            const report = await buildMemoryDebugReport(chatIdStr);
+
+            await logAction(chatIdStr, "debug_memory", { reportLength: report.length });
+
+            const buffer = Buffer.from(report, "utf-8");
+            await ctx.replyWithDocument(Input.fromBuffer(buffer, "memory_debug.md"));
+        } catch (error) {
+            const errMsg = error instanceof Error ? error.message : String(error);
+            console.error("Debug memory error:", errMsg);
+            await ctx.reply(`⚠️ Errore debug memory: ${errMsg.substring(0, 500)}`);
+        }
+    });
+
     bot.on("text", async (ctx) => {
         const userText = ctx.message.text;
         const chatIdStr = String(ctx.chat.id);
@@ -70,7 +91,7 @@ export function startBot(): Telegraf {
                     caption: reply.substring(0, 200) + "…",
                 });
             } else {
-                await ctx.reply(reply, { parse_mode: "Markdown" });
+                await ctx.reply(toTelegramHTML(reply), { parse_mode: "HTML" });
             }
         } catch (error) {
             const errMsg =

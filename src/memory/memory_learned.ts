@@ -1,4 +1,5 @@
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
+import { getEmbedding, cosineSimilarity } from "./memory_embeddings.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -13,6 +14,7 @@ export interface LearnedFact {
     confirmedAt: Date | null;
     timestamp: Date;
     chatId: string;
+    embedding?: number[];
 }
 
 // ---------------------------------------------------------------------------
@@ -23,36 +25,6 @@ let db: Firestore;
 function getDb(): Firestore {
     if (!db) db = getFirestore();
     return db;
-}
-
-/**
- * Keyword extraction for similarity search.
- */
-function extractKeywords(text: string): Set<string> {
-    return new Set(
-        text
-            .toLowerCase()
-            .replace(/[^\w\sàèéìòù]/g, "")
-            .split(/\s+/)
-            .filter((w) => w.length > 3)
-    );
-}
-
-/**
- * Keyword overlap similarity (0-1).
- */
-export function computeSimilarity(text1: string, text2: string): number {
-    const kw1 = extractKeywords(text1);
-    const kw2 = extractKeywords(text2);
-
-    if (kw1.size === 0 || kw2.size === 0) return 0;
-
-    let matches = 0;
-    for (const kw of kw1) {
-        if (kw2.has(kw)) matches++;
-    }
-
-    return matches / Math.max(kw1.size, kw2.size);
 }
 
 // ---------------------------------------------------------------------------
@@ -71,8 +43,16 @@ export async function saveLearned(
         needsConfirmation: boolean;
     }
 ): Promise<string> {
+    let embedding: number[] | undefined;
+    try {
+        embedding = await getEmbedding(fact.learnedFact);
+    } catch (err) {
+        console.error("Failed to compute embedding for learned fact:", err);
+    }
+
     const docRef = await getDb().collection("memory_learned").add({
         ...fact,
+        embedding: embedding ?? null,
         confirmedAt: null,
         timestamp: new Date(),
         chatId,
@@ -139,18 +119,30 @@ export async function getPendingConfirmation(
 export async function searchLearned(
     chatId: string,
     query: string,
-    threshold = 0.3
+    threshold = 0.5
 ): Promise<LearnedFact[]> {
     const all = await getLearnedFacts(chatId);
+    if (all.length === 0) return [];
 
-    return all
-        .map((f) => ({
-            fact: f,
-            score: computeSimilarity(query, f.learnedFact),
-        }))
-        .filter((item) => item.score > threshold)
-        .sort((a, b) => b.score - a.score)
-        .map((item) => item.fact);
+    try {
+        const queryVec = await getEmbedding(query);
+        const scored = all.map((f) => {
+            // Use stored embedding if available, skip if not
+            if (!f.embedding) return { fact: f, score: 0 };
+            return {
+                fact: f,
+                score: cosineSimilarity(queryVec, f.embedding),
+            };
+        });
+
+        return scored
+            .filter((item) => item.score > threshold)
+            .sort((a, b) => b.score - a.score)
+            .map((item) => item.fact);
+    } catch (err) {
+        console.error("searchLearned embedding failed:", err);
+        return [];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -168,5 +160,6 @@ function docToLearned(doc: FirebaseFirestore.QueryDocumentSnapshot): LearnedFact
         confirmedAt: d.confirmedAt?.toDate?.() ?? null,
         timestamp: d.timestamp?.toDate?.() ?? new Date(),
         chatId: d.chatId,
+        embedding: d.embedding ?? undefined,
     };
 }

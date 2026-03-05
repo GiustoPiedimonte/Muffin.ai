@@ -1,6 +1,6 @@
 import type { Message } from "./memory/memory_messages.js";
 
-type ClaudeModel = "claude-haiku-4-5-20251001" | "claude-sonnet-4-6-20250219" | "claude-3-5-sonnet-20241022";
+type ClaudeModel = "claude-haiku-4-5-20251001" | "claude-sonnet-4-6" | "claude-sonnet-4-5-20250929";
 
 interface RouterDecision {
     model: ClaudeModel;
@@ -9,7 +9,7 @@ interface RouterDecision {
 }
 
 const HAIKU_MODEL: ClaudeModel = "claude-haiku-4-5-20251001";
-const SONNET_MODEL: ClaudeModel = "claude-3-5-sonnet-20241022"; // Adjust according to available/preferred model versions
+const SONNET_MODEL: ClaudeModel = "claude-sonnet-4-6"; // Latest available Sonnet 4.6
 
 // Rough token estimation: 1 token ~= 4 chars (good enough for English/Italian mixed text without tiktoken)
 function estimateTokens(text: string): number {

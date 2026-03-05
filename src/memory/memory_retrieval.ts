@@ -87,8 +87,8 @@ async function buildEpisodicContext(chatId: string): Promise<string> {
         })
         .join("\n");
 
-    const header = isRecent 
-        ? "## Ultimi messaggi\n" 
+    const header = isRecent
+        ? "## Ultimi messaggi\n"
         : "## Riassunto conversazione recente\n";
     return `\n\n${header}${lines}`;
 }

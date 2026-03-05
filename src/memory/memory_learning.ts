@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { saveFact, type FactCategory } from "./memory_semantic.js";
+import { saveFact, deleteFact, type FactCategory } from "./memory_semantic.js";
 import { saveLearned, getPendingConfirmation, confirmLearned, rejectLearned } from "./memory_learned.js";
+import { detectConflict } from "./memory_conflicts.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -9,6 +10,8 @@ import { saveLearned, getPendingConfirmation, confirmLearned, rejectLearned } fr
 export interface LearningResult {
     savedFacts: string[];
     pendingConfirmations: { id: string; text: string }[];
+    conflicts: { oldFact: string; newFact: string }[];
+    updatedFacts: { oldFact: string; newFact: string }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +132,8 @@ export async function processLearnings(
     const result: LearningResult = {
         savedFacts: [],
         pendingConfirmations: [],
+        conflicts: [],
+        updatedFacts: [],
     };
 
     // Skip very short messages — unlikely to contain meaningful facts
@@ -180,6 +185,51 @@ export async function processLearnings(
             if (!validCategories.includes(cat)) continue;
 
             if (action.toLowerCase() === "salva") {
+                // Check for conflicts before saving
+                const conflict = await detectConflict(chatId, factText);
+
+                if (conflict.type === "duplicate") {
+                    // Silently skip duplicates
+                    continue;
+                }
+
+                if (conflict.type === "update") {
+                    // Auto-replace old fact
+                    await deleteFact(conflict.oldFactId);
+                    await saveFact(chatId, {
+                        key: factText,
+                        value: factText,
+                        category: cat,
+                        importance: "medium",
+                        source: "learned",
+                    });
+                    result.updatedFacts.push({
+                        oldFact: conflict.oldFact,
+                        newFact: factText,
+                    });
+                    continue;
+                }
+
+                if (conflict.type === "conflict") {
+                    // Don't save yet — ask user via confirmation
+                    const factId = await saveLearned(chatId, {
+                        learnedFact: factText,
+                        sourceMessage: userMessage,
+                        confidence: "low",
+                        needsConfirmation: true,
+                    });
+                    result.conflicts.push({
+                        oldFact: conflict.oldFact,
+                        newFact: factText,
+                    });
+                    result.pendingConfirmations.push({
+                        id: factId,
+                        text: factText,
+                    });
+                    continue;
+                }
+
+                // type === "new" — save normally
                 await saveFact(chatId, {
                     key: factText,
                     value: factText,
@@ -229,7 +279,17 @@ export function formatLearningResponse(result: LearningResult): string {
         parts.push(`💾 Ho salvato in memoria: ${items}`);
     }
 
-    if (result.pendingConfirmations.length > 0) {
+    if (result.updatedFacts.length > 0) {
+        for (const u of result.updatedFacts) {
+            parts.push(`🔄 Ho aggiornato: _${u.oldFact}_ → _${u.newFact}_`);
+        }
+    }
+
+    if (result.conflicts.length > 0) {
+        for (const c of result.conflicts) {
+            parts.push(`⚠️ Conflitto rilevato:\nPrima sapevo: _${c.oldFact}_\nOra dici: _${c.newFact}_\nSostituisco? Dimmelo in qualsiasi modo.`);
+        }
+    } else if (result.pendingConfirmations.length > 0) {
         for (const c of result.pendingConfirmations) {
             parts.push(`📝 Salvo in memoria che "${c.text}"? Dimmelo in qualsiasi modo.`);
         }

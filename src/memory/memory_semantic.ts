@@ -1,6 +1,7 @@
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import Anthropic from "@anthropic-ai/sdk";
 import type { Message } from "./memory_messages.js";
+import { getEmbedding, cosineSimilarity } from "./memory_embeddings.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,6 +26,7 @@ export interface SemanticFact {
     importance: FactImportance;
     source: "explicit" | "inferred" | "learned";
     chatId: string;
+    embedding?: number[];
 }
 
 export interface BatchResult {
@@ -78,33 +80,22 @@ function invalidateCache(chatId: string): void {
 }
 
 /**
- * Normalize text for keyword comparison:
- * lowercase, strip punctuation, split into words > 3 chars.
+ * Returns true if newFact is semantically very similar to existingFact (cosine > 0.85).
  */
-function extractKeywords(text: string): Set<string> {
-    const normalized = text
-        .toLowerCase()
-        .replace(/[^\w\sàèéìòù]/g, "")
-        .split(/\s+/)
-        .filter((w) => w.length > 3);
-    return new Set(normalized);
-}
-
-/**
- * Returns true if >60% of newFact's keywords appear in existingFact.
- */
-function isDuplicate(newFact: string, existingFact: string): boolean {
-    const newKeywords = extractKeywords(newFact);
-    const existingKeywords = extractKeywords(existingFact);
-
-    if (newKeywords.size === 0) return false;
-
-    let matches = 0;
-    for (const kw of newKeywords) {
-        if (existingKeywords.has(kw)) matches++;
+async function isDuplicate(
+    newFact: string,
+    existingFact: string,
+    existingEmbedding?: number[]
+): Promise<boolean> {
+    try {
+        const vecNew = await getEmbedding(newFact);
+        const vecExisting = existingEmbedding ?? await getEmbedding(existingFact);
+        const sim = cosineSimilarity(vecNew, vecExisting);
+        return sim > 0.85;
+    } catch (err) {
+        console.error("Embedding failed, falling back to strict equality", err);
+        return newFact.trim().toLowerCase() === existingFact.trim().toLowerCase();
     }
-
-    return matches / newKeywords.size > 0.6;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +115,7 @@ export async function loadFacts(chatId: string): Promise<SemanticFact[]> {
         .where("chatId", "==", chatId)
         .get();
 
-    let facts: SemanticFact[] = snap.docs.map((doc) => {
+    let facts: SemanticFact[] = snap.docs.map((doc: FirebaseFirestore.QueryDocumentSnapshot) => {
         const d = doc.data();
         return {
             id: doc.id,
@@ -135,6 +126,7 @@ export async function loadFacts(chatId: string): Promise<SemanticFact[]> {
             importance: d.importance || "medium",
             source: d.source || "inferred",
             chatId: d.chatId,
+            embedding: d.embedding ?? undefined,
         };
     });
 
@@ -151,14 +143,37 @@ export async function saveFact(
     chatId: string,
     fact: Omit<SemanticFact, "id" | "chatId" | "lastUpdated">
 ): Promise<string> {
+    let embedding = fact.embedding;
+    if (!embedding) {
+        try {
+            embedding = await getEmbedding(fact.value);
+        } catch (err) {
+            console.error("Failed to compute embedding for fact, saving without:", err);
+        }
+    }
+
     const docRef = await getDb().collection("memory_facts").add({
         ...fact,
+        embedding: embedding ?? null,
         chatId,
         lastUpdated: new Date(),
     });
 
     invalidateCache(chatId);
     return docRef.id;
+}
+
+/**
+ * Deletes a semantic fact by ID. Invalidates cache.
+ */
+export async function deleteFact(factId: string): Promise<void> {
+    const docRef = getDb().collection("memory_facts").doc(factId);
+    const doc = await docRef.get();
+    const chatId = doc.data()?.chatId;
+
+    await docRef.delete();
+
+    if (chatId) invalidateCache(chatId);
 }
 
 /**
@@ -278,15 +293,18 @@ export async function runBatch(chatId: string): Promise<BatchResult> {
         return { newFacts: [], duplicatesIgnored: 0 };
     }
 
-    // 3. Load existing facts for dedup
+    // 3. Load existing facts for dedup (with stored embeddings)
     const existingSnap = await db
         .collection("memory_facts")
         .where("chatId", "==", chatId)
         .get();
 
-    const existingFacts = existingSnap.docs.map((doc) => {
+    const existingFacts = existingSnap.docs.map((doc: FirebaseFirestore.QueryDocumentSnapshot) => {
         const d = doc.data();
-        return (d.value || d.fact || "") as string;
+        return {
+            text: (d.value || d.fact || "") as string,
+            embedding: (d.embedding ?? undefined) as number[] | undefined,
+        };
     });
 
     // 4. Deduplicate and save
@@ -294,9 +312,13 @@ export async function runBatch(chatId: string): Promise<BatchResult> {
     let duplicatesIgnored = 0;
 
     for (const fact of extractedFacts) {
-        const isDup = existingFacts.some((existing) =>
-            isDuplicate(fact, existing)
-        );
+        let isDup = false;
+        for (const existing of existingFacts) {
+            if (await isDuplicate(fact, existing.text, existing.embedding)) {
+                isDup = true;
+                break;
+            }
+        }
 
         if (isDup) {
             duplicatesIgnored++;
@@ -310,7 +332,7 @@ export async function runBatch(chatId: string): Promise<BatchResult> {
                 source: "inferred",
             });
             newFacts.push(fact);
-            existingFacts.push(fact);
+            existingFacts.push({ text: fact, embedding: undefined });
         }
     }
 

@@ -12,5 +12,17 @@ module.exports = {
                 NODE_ENV: "production",
             },
         },
+        {
+            name: "muffin-mcp",
+            script: "dist/mcp-server.js",
+            instances: 1,
+            autorestart: true,
+            watch: false,
+            max_restarts: 10,
+            restart_delay: 5000,
+            env: {
+                NODE_ENV: "production",
+            },
+        },
     ],
 };
