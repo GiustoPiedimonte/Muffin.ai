@@ -1,5 +1,6 @@
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import { getEmbedding, cosineSimilarity } from "./memory_embeddings.js";
+import { invalidateContextCache } from "./memory_cache.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,6 +34,7 @@ function getDb(): Firestore {
 
 /**
  * Saves a learned fact to Firestore.
+ * Invalidates context cache so next message reloads memory.
  */
 export async function saveLearned(
     chatId: string,
@@ -58,24 +60,43 @@ export async function saveLearned(
         chatId,
     });
 
+    invalidateContextCache(chatId);
     return docRef.id;
 }
 
 /**
  * Confirms a pending learned fact.
+ * Invalidates context cache.
  */
 export async function confirmLearned(factId: string): Promise<void> {
-    await getDb().collection("memory_learned").doc(factId).update({
+    const docRef = getDb().collection("memory_learned").doc(factId);
+    const doc = await docRef.get();
+    const chatId = doc.data()?.chatId;
+
+    await docRef.update({
         confirmedAt: new Date(),
         needsConfirmation: false,
     });
+
+    if (chatId) {
+        invalidateContextCache(chatId);
+    }
 }
 
 /**
  * Rejects a pending learned fact — deletes it.
+ * Invalidates context cache.
  */
 export async function rejectLearned(factId: string): Promise<void> {
-    await getDb().collection("memory_learned").doc(factId).delete();
+    const docRef = getDb().collection("memory_learned").doc(factId);
+    const doc = await docRef.get();
+    const chatId = doc.data()?.chatId;
+
+    await docRef.delete();
+
+    if (chatId) {
+        invalidateContextCache(chatId);
+    }
 }
 
 /**

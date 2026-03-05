@@ -1,88 +1,102 @@
+/**
+ * memory_cache.ts
+ * 
+ * Local in-memory cache for getRelevantContext() output.
+ * Reduces Firebase queries and embedding computations by caching the entire
+ * context string for each chat, with smart invalidation on new fact saves.
+ */
+
 // ---------------------------------------------------------------------------
-// Context Cache Layer
+// Types
 // ---------------------------------------------------------------------------
-// Purpose: Cache the full output of getRelevantContext() to avoid repeated
-// Firebase queries and embedding computations within the same chat session.
-//
-// How it works:
-// 1. On first message, context is fetched via getRelevantContext()
-// 2. Result is cached per chatId with TTL of 10 minutes
-// 3. Subsequent messages reuse cache if not expired
-// 4. Cache is automatically invalidated when new facts are saved
-// 5. Manual invalidation available for testing/debugging
 
 interface CacheEntry {
     context: string;
     timestamp: number;
 }
 
+// ---------------------------------------------------------------------------
+// Cache storage
+// ---------------------------------------------------------------------------
+
 const contextCache = new Map<string, CacheEntry>();
 const CONTEXT_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 // ---------------------------------------------------------------------------
-// Public API
+// Core functions
 // ---------------------------------------------------------------------------
 
 /**
- * Gets relevant context for a chat, using cache if valid.
- * If cache miss or expired, calls getRelevantContext() and caches result.
- *
- * @param chatId - The chat identifier
- * @param userMessage - Current user message (for context building, but cache is per-chat)
- * @param getRelevantContextFn - Function to call on cache miss
- * @returns The formatted context string to inject into Claude's system prompt
+ * Gets the cached context for a chat, or returns null if expired.
+ * Does NOT fetch fresh data — just returns what's cached.
  */
-export async function getCachedRelevantContext(
-    chatId: string,
-    userMessage: string,
-    getRelevantContextFn: (chatId: string, userMessage: string) => Promise<string>
-): Promise<string> {
+export function getCachedContext(chatId: string): string | null {
     const cached = contextCache.get(chatId);
 
-    // Hit: return cached
-    if (cached && Date.now() - cached.timestamp < CONTEXT_TTL_MS) {
-        return cached.context;
+    if (!cached) {
+        return null;
     }
 
-    // Miss: fetch and cache
-    const context = await getRelevantContextFn(chatId, userMessage);
-    contextCache.set(chatId, { context, timestamp: Date.now() });
+    if (Date.now() - cached.timestamp >= CONTEXT_TTL_MS) {
+        contextCache.delete(chatId);
+        return null;
+    }
 
-    return context;
+    return cached.context;
 }
 
 /**
- * Invalidates context cache for a specific chat.
- * Called automatically when new facts are saved.
+ * Sets the context cache for a chat.
+ * Called after successfully fetching fresh context from memory modules.
+ */
+export function setCachedContext(chatId: string, context: string): void {
+    contextCache.set(chatId, {
+        context,
+        timestamp: Date.now(),
+    });
+}
+
+/**
+ * Invalidates the context cache for a specific chat.
+ * Called whenever a new fact is saved to any memory module.
  */
 export function invalidateContextCache(chatId: string): void {
     contextCache.delete(chatId);
 }
 
 /**
- * Clears all context cache entries.
- * Useful for testing or on startup.
+ * Clears the entire cache (mainly for testing/cleanup).
  */
-export function clearAllContextCache(): void {
+export function clearContextCache(): void {
     contextCache.clear();
 }
 
 /**
- * Returns cache statistics for debugging.
+ * Wrapper that checks cache first, then calls the memory-retrieval module
+ * if no cached result is found.
  */
-export function getContextCacheStats(): {
-    entriesCount: number;
-    entries: Array<{ chatId: string; ageMs: number; isValid: boolean }>;
-} {
-    const now = Date.now();
-    const entries = Array.from(contextCache.entries()).map(([chatId, entry]) => {
-        const ageMs = now - entry.timestamp;
-        const isValid = ageMs < CONTEXT_TTL_MS;
-        return { chatId, ageMs, isValid };
-    });
+export async function getCachedRelevantContext(
+    chatId: string,
+    userMessage: string,
+    fetcher: (chatId: string, message: string) => Promise<string>
+): Promise<string> {
+    const cached = getCachedContext(chatId);
+    if (cached !== null) {
+        return cached;
+    }
 
+    // Fetch fresh
+    const freshContext = await fetcher(chatId, userMessage);
+    setCachedContext(chatId, freshContext);
+    return freshContext;
+}
+
+/**
+ * Returns cache stats for debugging.
+ */
+export function getCacheStats(): { size: number; entries: string[] } {
     return {
-        entriesCount: entries.length,
-        entries,
+        size: contextCache.size,
+        entries: Array.from(contextCache.keys()),
     };
 }

@@ -1,5 +1,6 @@
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import Anthropic from "@anthropic-ai/sdk";
+import { invalidateContextCache } from "./memory_cache.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -120,6 +121,9 @@ async function saveRawEpisode(
 
     // Trim old episodes: keep last MAX_EPISODES
     await trimEpisodes(chatId);
+
+    // Invalidate context cache so next message reloads memory
+    invalidateContextCache(chatId);
 }
 
 async function trimEpisodes(chatId: string): Promise<void> {
