@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:agent": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "mcp": "tsx src/mcp-server.ts"
