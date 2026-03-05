@@ -23,7 +23,7 @@ const MAX_EPISODES_IN_CONTEXT = 6;
  *
  * Conditionally includes:
  * 2. Learned facts matching the current message (similarity search)
- * 3. Recent episodes (only if significant time gap or topic change)
+ * 3. Recent episodes (always, but quantity varies by time gap)
  */
 export async function getRelevantContext(
     chatId: string,
@@ -43,7 +43,7 @@ export async function getRelevantContext(
     const learnedCtx = await buildLearnedContext(chatId, userMessage);
     if (learnedCtx) parts.push(learnedCtx);
 
-    // 3. Recent episodes — only if there's a significant time gap
+    // 4. Recent episodes — always included, but quantity varies by time gap
     const episodicCtx = await buildEpisodicContext(chatId);
     if (episodicCtx) parts.push(episodicCtx);
 
@@ -70,19 +70,14 @@ async function buildLearnedContext(
 }
 
 async function buildEpisodicContext(chatId: string): Promise<string> {
-    // Check time gap — only include episodes if last message was > 6h ago
+    // Determine time gap — vary episode count based on recency
     const lastTimestamp = await getLastEpisodeTimestamp(chatId);
+    const gap = lastTimestamp ? Date.now() - lastTimestamp.getTime() : null;
+    const isRecent = gap !== null && gap < GAP_THRESHOLD_MS;
 
-    if (lastTimestamp) {
-        const gap = Date.now() - lastTimestamp.getTime();
-        if (gap < GAP_THRESHOLD_MS) {
-            // Recent conversation — Claude already has the messages in history
-            return "";
-        }
-    }
-
-    // Significant gap — include recent paraphrased episodes as recap
-    const episodes = await getRecentEpisodes(chatId, MAX_EPISODES_IN_CONTEXT);
+    // Always include episodes, but vary quantity based on time gap
+    const episodeCount = isRecent ? 3 : MAX_EPISODES_IN_CONTEXT;
+    const episodes = await getRecentEpisodes(chatId, episodeCount);
     if (episodes.length === 0) return "";
 
     const lines = episodes
@@ -92,5 +87,8 @@ async function buildEpisodicContext(chatId: string): Promise<string> {
         })
         .join("\n");
 
-    return `\n\n## Riassunto conversazione recente\n${lines}`;
+    const header = isRecent 
+        ? "## Ultimi messaggi\n" 
+        : "## Riassunto conversazione recente\n";
+    return `\n\n${header}${lines}`;
 }
