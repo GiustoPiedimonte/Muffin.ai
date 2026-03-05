@@ -1,0 +1,24 @@
+{
+  "name": "muffin",
+  "version": "0.1.0",
+  "description": "Personal Telegram AI agent",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@tavily/core": "^0.5.0",
+    "dotenv": "^16.4.7",
+    "firebase-admin": "^13.0.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
