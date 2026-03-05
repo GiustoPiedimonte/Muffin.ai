@@ -19,7 +19,7 @@ export interface EpisodicMessage {
 // Config
 // ---------------------------------------------------------------------------
 
-const MAX_EPISODES = 50;
+const MAX_EPISODES = 20;
 const PARAPHRASE_MODEL = "claude-haiku-4-5-20251001";
 
 const PARAPHRASE_PROMPT = `Riformula il seguente messaggio in massimo 2 frasi, mantenendo l'essenza e le informazioni chiave.
@@ -67,7 +67,7 @@ async function paraphraseAndSave(
     direction: "user" | "muffin"
 ): Promise<void> {
     // Skip very short messages — not worth paraphrasing
-    if (text.length < 20) {
+    if (text.length < 40) {
         await saveRawEpisode(chatId, text, text, [], direction);
         return;
     }
@@ -124,18 +124,26 @@ async function saveRawEpisode(
 
 async function trimEpisodes(chatId: string): Promise<void> {
     const db = getDb();
-    const snap = await db
+    const snap = await getDb()
         .collection("memory_episodes")
         .where("chatId", "==", chatId)
-        .orderBy("timestamp", "desc")
-        .offset(MAX_EPISODES)
         .get();
 
     if (snap.empty) return;
 
+    // In-memory sort
+    const episodes = snap.docs.map((doc) => ({
+        doc,
+        timestamp: doc.data().timestamp?.toDate?.()?.getTime() ?? 0,
+    }));
+    episodes.sort((a, b) => b.timestamp - a.timestamp);
+
+    const toDelete = episodes.slice(MAX_EPISODES);
+    if (toDelete.length === 0) return;
+
     const batch = db.batch();
-    for (const doc of snap.docs) {
-        batch.delete(doc.ref);
+    for (const item of toDelete) {
+        batch.delete(item.doc.ref);
     }
     await batch.commit();
 }
@@ -154,11 +162,12 @@ export async function getRecentEpisodes(
     const snap = await getDb()
         .collection("memory_episodes")
         .where("chatId", "==", chatId)
-        .orderBy("timestamp", "desc")
-        .limit(limit)
         .get();
 
-    return snap.docs.map(docToEpisode).reverse(); // chronological order
+    const episodes = snap.docs.map(docToEpisode);
+    episodes.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+    return episodes.slice(0, limit).reverse(); // chronological order
 }
 
 /**
@@ -175,11 +184,12 @@ export async function getEpisodesByTopic(
         .collection("memory_episodes")
         .where("chatId", "==", chatId)
         .where("topics", "array-contains", topicLower)
-        .orderBy("timestamp", "desc")
-        .limit(10)
         .get();
 
-    return snap.docs.map(docToEpisode);
+    const episodes = snap.docs.map(docToEpisode);
+    episodes.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+    return episodes.slice(0, 10);
 }
 
 /**
@@ -191,14 +201,17 @@ export async function getLastEpisodeTimestamp(
     const snap = await getDb()
         .collection("memory_episodes")
         .where("chatId", "==", chatId)
-        .orderBy("timestamp", "desc")
-        .limit(1)
         .get();
 
     if (snap.empty) return null;
 
-    const d = snap.docs[0].data();
-    return d.timestamp?.toDate?.() ?? null;
+    let maxTime = 0;
+    for (const doc of snap.docs) {
+        const t = doc.data().timestamp?.toDate?.()?.getTime() ?? 0;
+        if (t > maxTime) maxTime = t;
+    }
+
+    return maxTime > 0 ? new Date(maxTime) : null;
 }
 
 // ---------------------------------------------------------------------------

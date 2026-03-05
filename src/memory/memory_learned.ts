@@ -105,10 +105,11 @@ export async function getLearnedFacts(chatId: string): Promise<LearnedFact[]> {
     const snap = await getDb()
         .collection("memory_learned")
         .where("chatId", "==", chatId)
-        .orderBy("timestamp", "desc")
         .get();
 
-    return snap.docs.map(docToLearned);
+    const facts = snap.docs.map(docToLearned);
+    facts.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+    return facts;
 }
 
 /**
@@ -121,12 +122,14 @@ export async function getPendingConfirmation(
         .collection("memory_learned")
         .where("chatId", "==", chatId)
         .where("needsConfirmation", "==", true)
-        .orderBy("timestamp", "desc")
-        .limit(1)
         .get();
 
     if (snap.empty) return null;
-    return docToLearned(snap.docs[0]);
+
+    const facts = snap.docs.map(docToLearned);
+    facts.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+    return facts[0];
 }
 
 /**

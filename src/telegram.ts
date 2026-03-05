@@ -1,146 +1,7 @@
 import { Telegraf, Input } from "telegraf";
-import Anthropic from "@anthropic-ai/sdk";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { getHistory, saveMessages, type Message } from "./memory.js";
-import { searchToolDefinition, executeSearch } from "./tools/search.js";
-import { readGitToolDefinition, executeReadGit } from "./tools/readGit.js";
-import { checkExplicitMemory, saveExplicitFact } from "./memory/memory_semantic.js";
-import { getRelevantContext } from "./memory/memory_retrieval.js";
-import { processLearnings, formatLearningResponse } from "./memory/memory_learning.js";
-import { saveEpisode } from "./memory/memory_episodic.js";
-import { confirmLearned, rejectLearned, getPendingConfirmation } from "./memory/memory_learned.js";
-import { runBatch } from "./memory_facts.js";
+import { runBatch } from "./memory/memory_semantic.js";
 import { logAction } from "./logger.js";
-import { enqueue } from "./queue.js";
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-const MODEL = "claude-haiku-4-5-20251001";
-const MAX_TELEGRAM_LENGTH = 4000;
-
-let systemPrompt: string;
-
-function loadSystemPrompt(): string {
-    if (!systemPrompt) {
-        const agentPath = resolve(process.cwd(), "context", "AGENT.md");
-        const userPath = resolve(process.cwd(), "context", "USER.md");
-        const projectsPath = resolve(process.cwd(), "context", "PROJECTS.md");
-
-        const agentMd = readFileSync(agentPath, "utf-8");
-        const userMd = readFileSync(userPath, "utf-8");
-        const projectsMd = readFileSync(projectsPath, "utf-8");
-
-        systemPrompt = `${agentMd}\n\n---\n\n${userMd}\n\n---\n\n${projectsMd}`;
-    }
-    return systemPrompt;
-}
-
-// ---------------------------------------------------------------------------
-// Claude client
-// ---------------------------------------------------------------------------
-
-let claude: Anthropic;
-
-function getClaude(): Anthropic {
-    if (!claude) {
-        claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    }
-    return claude;
-}
-
-// ---------------------------------------------------------------------------
-// Tool handling loop
-// ---------------------------------------------------------------------------
-
-async function callClaude(
-    history: Message[],
-    userMessage: string,
-    chatId: string
-): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
-    const client = getClaude();
-    const basePrompt = loadSystemPrompt();
-    const memoryContext = await getRelevantContext(chatId, userMessage);
-    const system = basePrompt + memoryContext;
-
-    const messages: Anthropic.MessageParam[] = [
-        ...history.map((m) => ({
-            role: m.role as "user" | "assistant",
-            content: m.content,
-        })),
-        { role: "user", content: userMessage },
-    ];
-
-    await logAction(chatId, "claude_call", { model: MODEL, historyLength: history.length });
-
-    let response = await client.messages.create({
-        model: MODEL,
-        max_tokens: 4096,
-        system,
-        tools: [searchToolDefinition, readGitToolDefinition],
-        messages,
-    });
-
-    // Accumulate token usage across all API calls
-    let totalInput = response.usage.input_tokens;
-    let totalOutput = response.usage.output_tokens;
-
-    // Tool-use loop: keep calling tools until we get a final text response
-    while (response.stop_reason === "tool_use") {
-        const assistantContent = response.content;
-        messages.push({ role: "assistant", content: assistantContent });
-
-        const toolResults: Anthropic.ToolResultBlockParam[] = [];
-
-        for (const block of assistantContent) {
-            if (block.type === "tool_use") {
-                await logAction(chatId, "tool_use", { tool: block.name, input: block.input });
-
-                let result: string;
-
-                if (block.name === "web_search") {
-                    result = await executeSearch(
-                        block.input as { query: string }
-                    );
-                } else if (block.name === "read_github_file") {
-                    result = await executeReadGit(
-                        block.input as { owner: string; repo: string; path: string; branch?: string }
-                    );
-                } else {
-                    result = `Unknown tool: ${block.name}`;
-                }
-
-                toolResults.push({
-                    type: "tool_result",
-                    tool_use_id: block.id,
-                    content: result,
-                });
-            }
-        }
-
-        messages.push({ role: "user", content: toolResults });
-
-        response = await client.messages.create({
-            model: MODEL,
-            max_tokens: 4096,
-            system,
-            tools: [searchToolDefinition],
-            messages,
-        });
-
-        totalInput += response.usage.input_tokens;
-        totalOutput += response.usage.output_tokens;
-    }
-
-    // Extract final text
-    const textBlocks = response.content.filter(
-        (b): b is Anthropic.TextBlock => b.type === "text"
-    );
-    const text = textBlocks.map((b) => b.text).join("\n");
-    return { text, inputTokens: totalInput, outputTokens: totalOutput };
-}
+import { processMessage } from "./gateway.js";
 
 // ---------------------------------------------------------------------------
 // Telegram bot
@@ -196,97 +57,21 @@ export function startBot(): Telegraf {
         const chatIdStr = String(ctx.chat.id);
 
         try {
-            await logAction(chatIdStr, "message_received", {
-                length: userText.length,
-            });
-
-            // Check for explicit memory pattern
-            const explicitFact = checkExplicitMemory(userText);
-            if (explicitFact) {
-                await saveExplicitFact(chatIdStr, explicitFact);
-                await logAction(chatIdStr, "explicit_memory_saved", { fact: explicitFact });
-                await ctx.reply("Salvato ✓");
-                return;
-            }
-
-            // Check for pending memory confirmation (sì/no)
-            const lowerText = userText.toLowerCase().trim();
-            if (lowerText === "sì" || lowerText === "si" || lowerText === "no") {
-                const pending = await getPendingConfirmation(chatIdStr);
-                if (pending && pending.id) {
-                    if (lowerText === "no") {
-                        await rejectLearned(pending.id);
-                        await logAction(chatIdStr, "memory_confirmed", { factId: pending.id, confirmed: false });
-                        await ctx.reply("Ok, non salvato ✓");
-                    } else {
-                        await confirmLearned(pending.id);
-                        await logAction(chatIdStr, "memory_confirmed", { factId: pending.id, confirmed: true });
-                        await ctx.reply("Salvato in memoria ✓");
-                    }
-                    return;
-                }
-            }
-
-            // Show "typing" indicator
+            // Show "typing" indicator immediately
             await ctx.sendChatAction("typing");
 
-            // Load history
-            const history = await getHistory(chatIdStr);
+            // Process the message via the gateway
+            const { reply, isDocument } = await processMessage(chatIdStr, userText);
 
-            // Call Claude (through rate-limited queue)
-            const { text: reply, inputTokens, outputTokens } = await enqueue(() => callClaude(history, userText, chatIdStr));
-            const totalTokens = inputTokens + outputTokens;
-            const tokenFooter = `\n\n> \`(${totalTokens}/${inputTokens}/${outputTokens})\``;
-
-            // Save user + assistant messages
-            await saveMessages(chatIdStr, [
-                { role: "user", content: userText },
-                { role: "assistant", content: reply },
-            ]);
-
-            // Save episodic memory (async, non-blocking)
-            saveEpisode(chatIdStr, userText, reply).catch((err) =>
-                console.error("Episodic save failed:", err)
-            );
-
-            // Process learnings (async, non-blocking)
-            let learningFooter = "";
-            try {
-                const learnings = await processLearnings(chatIdStr, userText, reply);
-                learningFooter = formatLearningResponse(learnings);
-
-                if (learnings.savedFacts.length > 0) {
-                    await logAction(chatIdStr, "memory_saved", { facts: learnings.savedFacts });
-                }
-                if (learnings.pendingConfirmations.length > 0) {
-                    await logAction(chatIdStr, "memory_confirmation_sent", {
-                        confirmations: learnings.pendingConfirmations.map((c) => c.text),
-                    });
-                }
-            } catch (err) {
-                console.error("Learning processing failed:", err);
-            }
-
-            // Send response
-            const fullReply = reply + tokenFooter + (learningFooter ? `\n\n${learningFooter}` : "");
-            const isFile = fullReply.length > MAX_TELEGRAM_LENGTH;
-            if (isFile) {
+            if (isDocument) {
                 // Send as .md file
-                const buffer = Buffer.from(fullReply, "utf-8");
+                const buffer = Buffer.from(reply, "utf-8");
                 await ctx.replyWithDocument(Input.fromBuffer(buffer, "response.md"), {
                     caption: reply.substring(0, 200) + "…",
                 });
             } else {
-                await ctx.reply(fullReply, { parse_mode: "Markdown" });
+                await ctx.reply(reply, { parse_mode: "Markdown" });
             }
-
-            await logAction(chatIdStr, "response_sent", {
-                length: reply.length,
-                type: isFile ? "file" : "text",
-                inputTokens,
-                outputTokens,
-                totalTokens,
-            });
         } catch (error) {
             const errMsg =
                 error instanceof Error ? error.message : String(error);

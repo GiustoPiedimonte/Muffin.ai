@@ -1,6 +1,7 @@
 import { buildSemanticContext } from "./memory_semantic.js";
 import { searchLearned, type LearnedFact } from "./memory_learned.js";
 import { getRecentEpisodes, getLastEpisodeTimestamp } from "./memory_episodic.js";
+import { getMemorySummary } from "./memory_compression.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -34,7 +35,11 @@ export async function getRelevantContext(
     const semanticCtx = await buildSemanticContext(chatId);
     if (semanticCtx) parts.push(semanticCtx);
 
-    // 2. Learned facts — filtered by relevance to current message
+    // 2. Compressed historical memory summary if exists
+    const summaryCtx = await getMemorySummary(chatId);
+    if (summaryCtx) parts.push(`\n\n## Riassunto Storico\n${summaryCtx}`);
+
+    // 3. Learned facts — filtered by relevance to current message
     const learnedCtx = await buildLearnedContext(chatId, userMessage);
     if (learnedCtx) parts.push(learnedCtx);
 

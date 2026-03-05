@@ -1,4 +1,6 @@
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
+import Anthropic from "@anthropic-ai/sdk";
+import type { Message } from "./memory_messages.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -23,6 +25,11 @@ export interface SemanticFact {
     importance: FactImportance;
     source: "explicit" | "inferred" | "learned";
     chatId: string;
+}
+
+export interface BatchResult {
+    newFacts: string[];
+    duplicatesIgnored: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +77,36 @@ function invalidateCache(chatId: string): void {
     cache.delete(chatId);
 }
 
+/**
+ * Normalize text for keyword comparison:
+ * lowercase, strip punctuation, split into words > 3 chars.
+ */
+function extractKeywords(text: string): Set<string> {
+    const normalized = text
+        .toLowerCase()
+        .replace(/[^\w\sàèéìòù]/g, "")
+        .split(/\s+/)
+        .filter((w) => w.length > 3);
+    return new Set(normalized);
+}
+
+/**
+ * Returns true if >60% of newFact's keywords appear in existingFact.
+ */
+function isDuplicate(newFact: string, existingFact: string): boolean {
+    const newKeywords = extractKeywords(newFact);
+    const existingKeywords = extractKeywords(existingFact);
+
+    if (newKeywords.size === 0) return false;
+
+    let matches = 0;
+    for (const kw of newKeywords) {
+        if (existingKeywords.has(kw)) matches++;
+    }
+
+    return matches / newKeywords.size > 0.6;
+}
+
 // ---------------------------------------------------------------------------
 // Core functions
 // ---------------------------------------------------------------------------
@@ -85,14 +122,13 @@ export async function loadFacts(chatId: string): Promise<SemanticFact[]> {
     const snap = await getDb()
         .collection("memory_facts")
         .where("chatId", "==", chatId)
-        .orderBy("lastUpdated", "desc")
         .get();
 
-    const facts: SemanticFact[] = snap.docs.map((doc) => {
+    let facts: SemanticFact[] = snap.docs.map((doc) => {
         const d = doc.data();
         return {
             id: doc.id,
-            key: d.key || d.fact || "",
+            key: d.key || d.fact || "", // support old format 'fact'
             value: d.value || d.fact || "",
             category: d.category || "preferences",
             lastUpdated: d.lastUpdated?.toDate?.() ?? d.timestamp?.toDate?.() ?? new Date(),
@@ -101,6 +137,8 @@ export async function loadFacts(chatId: string): Promise<SemanticFact[]> {
             chatId: d.chatId,
         };
     });
+
+    facts.sort((a, b) => b.lastUpdated.getTime() - a.lastUpdated.getTime());
 
     cache.set(chatId, { facts, loadedAt: Date.now() });
     return facts;
@@ -135,7 +173,7 @@ export async function getFactsByCategory(
 }
 
 // ---------------------------------------------------------------------------
-// Explicit memory (migrated from memory_facts.ts)
+// Explicit memory
 // ---------------------------------------------------------------------------
 
 /**
@@ -170,6 +208,117 @@ export async function saveExplicitFact(
 }
 
 // ---------------------------------------------------------------------------
+// Batch Manual Extraction
+// ---------------------------------------------------------------------------
+
+const BATCH_SYSTEM_PROMPT = `Analizza queste conversazioni ed estrai fatti permanenti e rilevanti sull'utente.
+Cerca: preferenze, abitudini, obiettivi, informazioni personali, pattern ricorrenti.
+Ignora domande casuali e task one-shot.
+Rispondi SOLO con bullet points brevi (uno per riga, prefisso "- ").
+Se non trovi niente di rilevante: NIENTE`;
+
+/**
+ * Runs the batch extraction pipeline:
+ * 1. Loads last 24h conversations
+ * 2. Calls Claude to extract facts
+ * 3. Deduplicates against existing memory_facts
+ * 4. Saves new facts
+ */
+export async function runBatch(chatId: string): Promise<BatchResult> {
+    const db = getDb();
+
+    // 1. Load conversation
+    const convSnap = await db
+        .collection("conversations")
+        .doc(chatId)
+        .get();
+
+    if (!convSnap.exists) {
+        return { newFacts: [], duplicatesIgnored: 0 };
+    }
+
+    const convData = convSnap.data();
+    const messages = (convData?.messages ?? []) as Message[];
+
+    if (messages.length === 0) {
+        return { newFacts: [], duplicatesIgnored: 0 };
+    }
+
+    // Format conversation for Claude
+    const conversationText = messages
+        .map((m) => `${m.role}: ${m.content}`)
+        .join("\n");
+
+    // 2. Call Claude to extract facts
+    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const response = await client.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 1024,
+        system: BATCH_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: conversationText }],
+    });
+
+    const textBlocks = response.content.filter(
+        (b): b is Anthropic.TextBlock => b.type === "text"
+    );
+    const rawOutput = textBlocks.map((b) => b.text).join("\n").trim();
+
+    // If Claude says NIENTE or returns empty
+    if (!rawOutput || rawOutput.toUpperCase() === "NIENTE") {
+        return { newFacts: [], duplicatesIgnored: 0 };
+    }
+
+    // Parse bullet points
+    const extractedFacts = rawOutput
+        .split("\n")
+        .map((line) => line.replace(/^[-•*]\s*/, "").trim())
+        .filter((line) => line.length > 0);
+
+    if (extractedFacts.length === 0) {
+        return { newFacts: [], duplicatesIgnored: 0 };
+    }
+
+    // 3. Load existing facts for dedup
+    const existingSnap = await db
+        .collection("memory_facts")
+        .where("chatId", "==", chatId)
+        .get();
+
+    const existingFacts = existingSnap.docs.map((doc) => {
+        const d = doc.data();
+        return (d.value || d.fact || "") as string;
+    });
+
+    // 4. Deduplicate and save
+    const newFacts: string[] = [];
+    let duplicatesIgnored = 0;
+
+    for (const fact of extractedFacts) {
+        const isDup = existingFacts.some((existing) =>
+            isDuplicate(fact, existing)
+        );
+
+        if (isDup) {
+            duplicatesIgnored++;
+        } else {
+            // Save using new format
+            await saveFact(chatId, {
+                key: fact,
+                value: fact,
+                category: "inferred" as unknown as FactCategory, // fallback
+                importance: "medium",
+                source: "inferred",
+            });
+            newFacts.push(fact);
+            existingFacts.push(fact);
+        }
+    }
+
+    return { newFacts, duplicatesIgnored };
+}
+
+
+// ---------------------------------------------------------------------------
 // Context builder
 // ---------------------------------------------------------------------------
 
@@ -197,6 +346,7 @@ export async function buildSemanticContext(chatId: string): Promise<string> {
         interests: "Interessi",
         priorities: "Priorità",
         preferences: "Preferenze",
+        inferred: "Informazioni Aggiuntive" // For older 'inferred' data or untyped batch
     };
 
     const sections: string[] = [];

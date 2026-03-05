@@ -1,4 +1,5 @@
 import { getFirestore, Firestore } from "firebase-admin/firestore";
+import { triggerCompressionIfNeeded } from "./memory_compression.js";
 
 export interface Message {
     role: "user" | "assistant";
@@ -9,8 +10,6 @@ interface ConversationDoc {
     messages: Message[];
     updatedAt: FirebaseFirestore.Timestamp;
 }
-
-const MAX_HISTORY = 50;
 
 let db: Firestore;
 
@@ -53,11 +52,6 @@ export async function saveMessages(
 
     messages.push(...newMessages);
 
-    // Trim to last MAX_HISTORY messages
-    if (messages.length > MAX_HISTORY) {
-        messages = messages.slice(-MAX_HISTORY);
-    }
-
     await docRef.set(
         {
             messages,
@@ -65,6 +59,9 @@ export async function saveMessages(
         },
         { merge: true }
     );
+
+    // Trigger compression in background. It will trim the history if it exceeds the threshold.
+    triggerCompressionIfNeeded(chatId, messages).catch(err => console.error("Compression trigger error:", err));
 }
 
 /**
