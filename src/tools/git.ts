@@ -120,6 +120,49 @@ export const gitCommitToolDefinition: Anthropic.Tool = {
     },
 };
 
+export const gitBranchToolDefinition: Anthropic.Tool = {
+    name: "git_branch",
+    description: "List, create, checkout, or delete branches.",
+    input_schema: {
+        type: "object" as const,
+        properties: {
+            action: {
+                type: "string",
+                description: "Action to perform: 'list', 'create', 'checkout', 'delete'",
+                enum: ["list", "create", "checkout", "delete"]
+            },
+            branch_name: {
+                type: "string",
+                description: "Name of the branch (required for create, checkout, delete)."
+            }
+        },
+        required: ["action"],
+    },
+};
+
+export const gitPushToolDefinition: Anthropic.Tool = {
+    name: "git_push",
+    description: "Push commits to a remote repository.",
+    input_schema: {
+        type: "object" as const,
+        properties: {
+            remote: {
+                type: "string",
+                description: "Remote name, defaults to 'origin'.",
+            },
+            branch: {
+                type: "string",
+                description: "Branch name, defaults to current branch.",
+            },
+            force: {
+                type: "boolean",
+                description: "Whether to force push. Use with caution.",
+            }
+        },
+        required: [],
+    },
+};
+
 // ---------------------------------------------------------------------------
 // Tool executors
 // ---------------------------------------------------------------------------
@@ -205,5 +248,74 @@ export async function executeGitCommit(input: GitCommitInput): Promise<string> {
     } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         return `Error running git commit: ${msg}`;
+    }
+}
+
+interface GitBranchInput {
+    action: "list" | "create" | "checkout" | "delete";
+    branch_name?: string;
+}
+
+export async function executeGitBranch(input: GitBranchInput): Promise<string> {
+    try {
+        if (input.action === "list") {
+            const output = await git(["branch", "-a"]);
+            return output || "No branches found.";
+        }
+
+        if (!input.branch_name) {
+            return "Error: branch_name is required for this action.";
+        }
+
+        switch (input.action) {
+            case "create":
+                await git(["branch", input.branch_name]);
+                return `Created branch: ${input.branch_name}`;
+            case "checkout":
+                await git(["checkout", input.branch_name]);
+                return `Switched to branch: ${input.branch_name}`;
+            case "delete":
+                if (input.branch_name === "main" || input.branch_name === "master") {
+                    return `Error: Cannot delete protected branch '${input.branch_name}'.`;
+                }
+                const output = await git(["branch", "-D", input.branch_name]);
+                return output || `Deleted branch: ${input.branch_name}`;
+            default:
+                return "Error: Invalid action.";
+        }
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return `Error running git branch: ${msg}`;
+    }
+}
+
+interface GitPushInput {
+    remote?: string;
+    branch?: string;
+    force?: boolean;
+}
+
+export async function executeGitPush(input: GitPushInput): Promise<string> {
+    try {
+        const remote = input.remote || "origin";
+        let branch = input.branch;
+        if (!branch) {
+            // Get current branch
+            branch = await git(["branch", "--show-current"]);
+        }
+
+        if (branch === "main" || branch === "master") {
+            return `Error: Pushing directly to '${branch}' is protected. Please create a pull request or merge locally according to your workflow.`;
+        }
+
+        const args = ["push"];
+        if (input.force) args.push("--force");
+        args.push(remote, branch);
+
+        const output = await git(args);
+        return output || `Pushed successfully to ${remote}/${branch}.`;
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return `Error running git push: ${msg}`;
     }
 }

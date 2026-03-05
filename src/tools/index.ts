@@ -22,6 +22,10 @@ import {
     executeGitAdd,
     gitCommitToolDefinition,
     executeGitCommit,
+    gitBranchToolDefinition,
+    executeGitBranch,
+    gitPushToolDefinition,
+    executeGitPush,
 } from "./git.js";
 
 // Helper type for tool actions classification
@@ -95,6 +99,16 @@ export const toolsRegistry: Record<string, ToolRegistryEntry> = {
     git_commit: {
         definition: gitCommitToolDefinition,
         execute: async (input) => executeGitCommit(input as { message: string }),
+        category: "always_ask",
+    },
+    git_branch: {
+        definition: gitBranchToolDefinition,
+        execute: async (input) => executeGitBranch(input as { action: "list" | "create" | "checkout" | "delete"; branch_name?: string }),
+        category: "contextual",
+    },
+    git_push: {
+        definition: gitPushToolDefinition,
+        execute: async (input) => executeGitPush(input as { remote?: string; branch?: string; force?: boolean }),
         category: "always_ask",
     },
 };

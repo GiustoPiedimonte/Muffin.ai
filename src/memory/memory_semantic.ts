@@ -243,6 +243,7 @@ Se non trovi niente di rilevante: NIENTE`;
  * 2. Calls Claude to extract facts
  * 3. Deduplicates against existing memory_facts
  * 4. Saves new facts
+ * 5. Invalidates context cache for freshness guarantee
  */
 export async function runBatch(chatId: string): Promise<BatchResult> {
     const db = getDb();
@@ -285,6 +286,8 @@ export async function runBatch(chatId: string): Promise<BatchResult> {
 
     // If Claude says NIENTE or returns empty
     if (!rawOutput || rawOutput.toUpperCase() === "NIENTE") {
+        // Even with no new facts, invalidate cache for consistency
+        invalidateContextCache(chatId);
         return { newFacts: [], duplicatesIgnored: 0 };
     }
 
@@ -295,6 +298,8 @@ export async function runBatch(chatId: string): Promise<BatchResult> {
         .filter((line) => line.length > 0);
 
     if (extractedFacts.length === 0) {
+        // Even with no parsed facts, invalidate cache for consistency
+        invalidateContextCache(chatId);
         return { newFacts: [], duplicatesIgnored: 0 };
     }
 
@@ -339,6 +344,11 @@ export async function runBatch(chatId: string): Promise<BatchResult> {
             newFacts.push(fact);
             existingFacts.push({ text: fact, embedding: undefined });
         }
+    }
+
+    // 5. Ensure context cache is fresh even if all facts were duplicates
+    if (newFacts.length === 0) {
+        invalidateContextCache(chatId);
     }
 
     return { newFacts, duplicatesIgnored };
