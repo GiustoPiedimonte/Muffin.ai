@@ -2,6 +2,7 @@ import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import Anthropic from "@anthropic-ai/sdk";
 import type { Message } from "./memory_messages.js";
 import { getEmbedding, cosineSimilarity } from "./memory_embeddings.js";
+import { invalidateContextCache } from "./memory_cache.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -137,7 +138,7 @@ export async function loadFacts(chatId: string): Promise<SemanticFact[]> {
 }
 
 /**
- * Saves a new semantic fact. Invalidates cache.
+ * Saves a new semantic fact. Invalidates local cache and context cache.
  */
 export async function saveFact(
     chatId: string,
@@ -160,6 +161,7 @@ export async function saveFact(
     });
 
     invalidateCache(chatId);
+    invalidateContextCache(chatId);
     return docRef.id;
 }
 
@@ -173,7 +175,10 @@ export async function deleteFact(factId: string): Promise<void> {
 
     await docRef.delete();
 
-    if (chatId) invalidateCache(chatId);
+    if (chatId) {
+        invalidateCache(chatId);
+        invalidateContextCache(chatId);
+    }
 }
 
 /**
