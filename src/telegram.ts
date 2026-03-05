@@ -5,12 +5,12 @@ import { resolve } from "node:path";
 import { getHistory, saveMessages, type Message } from "./memory.js";
 import { searchToolDefinition, executeSearch } from "./tools/search.js";
 import { readGitToolDefinition, executeReadGit } from "./tools/readGit.js";
-import {
-    checkExplicitMemory,
-    saveExplicitFact,
-    runBatch,
-    buildMemoryContext,
-} from "./memory_facts.js";
+import { checkExplicitMemory, saveExplicitFact } from "./memory/memory_semantic.js";
+import { getRelevantContext } from "./memory/memory_retrieval.js";
+import { processLearnings, formatLearningResponse } from "./memory/memory_learning.js";
+import { saveEpisode } from "./memory/memory_episodic.js";
+import { confirmLearned, rejectLearned, getPendingConfirmation } from "./memory/memory_learned.js";
+import { runBatch } from "./memory_facts.js";
 import { logAction } from "./logger.js";
 import { enqueue } from "./queue.js";
 
@@ -62,7 +62,7 @@ async function callClaude(
 ): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
     const client = getClaude();
     const basePrompt = loadSystemPrompt();
-    const memoryContext = await buildMemoryContext(chatId);
+    const memoryContext = await getRelevantContext(chatId, userMessage);
     const system = basePrompt + memoryContext;
 
     const messages: Anthropic.MessageParam[] = [
@@ -209,6 +209,24 @@ export function startBot(): Telegraf {
                 return;
             }
 
+            // Check for pending memory confirmation (sì/no)
+            const lowerText = userText.toLowerCase().trim();
+            if (lowerText === "sì" || lowerText === "si" || lowerText === "no") {
+                const pending = await getPendingConfirmation(chatIdStr);
+                if (pending && pending.id) {
+                    if (lowerText === "no") {
+                        await rejectLearned(pending.id);
+                        await logAction(chatIdStr, "memory_confirmed", { factId: pending.id, confirmed: false });
+                        await ctx.reply("Ok, non salvato ✓");
+                    } else {
+                        await confirmLearned(pending.id);
+                        await logAction(chatIdStr, "memory_confirmed", { factId: pending.id, confirmed: true });
+                        await ctx.reply("Salvato in memoria ✓");
+                    }
+                    return;
+                }
+            }
+
             // Show "typing" indicator
             await ctx.sendChatAction("typing");
 
@@ -218,7 +236,7 @@ export function startBot(): Telegraf {
             // Call Claude (through rate-limited queue)
             const { text: reply, inputTokens, outputTokens } = await enqueue(() => callClaude(history, userText, chatIdStr));
             const totalTokens = inputTokens + outputTokens;
-            const tokenFooter = `\n\n\`(${totalTokens}/${inputTokens}/${outputTokens})\``;
+            const tokenFooter = `\n\n> \`(${totalTokens}/${inputTokens}/${outputTokens})\``;
 
             // Save user + assistant messages
             await saveMessages(chatIdStr, [
@@ -226,8 +244,31 @@ export function startBot(): Telegraf {
                 { role: "assistant", content: reply },
             ]);
 
+            // Save episodic memory (async, non-blocking)
+            saveEpisode(chatIdStr, userText, reply).catch((err) =>
+                console.error("Episodic save failed:", err)
+            );
+
+            // Process learnings (async, non-blocking)
+            let learningFooter = "";
+            try {
+                const learnings = await processLearnings(chatIdStr, userText, reply);
+                learningFooter = formatLearningResponse(learnings);
+
+                if (learnings.savedFacts.length > 0) {
+                    await logAction(chatIdStr, "memory_saved", { facts: learnings.savedFacts });
+                }
+                if (learnings.pendingConfirmations.length > 0) {
+                    await logAction(chatIdStr, "memory_confirmation_sent", {
+                        confirmations: learnings.pendingConfirmations.map((c) => c.text),
+                    });
+                }
+            } catch (err) {
+                console.error("Learning processing failed:", err);
+            }
+
             // Send response
-            const fullReply = reply + tokenFooter;
+            const fullReply = reply + tokenFooter + (learningFooter ? `\n\n${learningFooter}` : "");
             const isFile = fullReply.length > MAX_TELEGRAM_LENGTH;
             if (isFile) {
                 // Send as .md file

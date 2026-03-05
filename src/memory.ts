@@ -10,7 +10,7 @@ interface ConversationDoc {
     updatedAt: FirebaseFirestore.Timestamp;
 }
 
-const MAX_HISTORY = 20;
+const MAX_HISTORY = 50;
 
 let db: Firestore;
 
@@ -65,4 +65,21 @@ export async function saveMessages(
         },
         { merge: true }
     );
+}
+
+/**
+ * Returns the timestamp of the last conversation update.
+ */
+export async function getLastMessageTimestamp(
+    chatId: string
+): Promise<Date | null> {
+    const doc = await getDb()
+        .collection("conversations")
+        .doc(chatId)
+        .get();
+
+    if (!doc.exists) return null;
+
+    const data = doc.data();
+    return data?.updatedAt?.toDate?.() ?? null;
 }

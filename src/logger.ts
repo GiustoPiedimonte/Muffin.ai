@@ -11,7 +11,10 @@ export type LogAction =
     | "response_sent"
     | "error"
     | "explicit_memory_saved"
-    | "batch_run";
+    | "batch_run"
+    | "memory_saved"
+    | "memory_confirmation_sent"
+    | "memory_confirmed";
 
 interface LogEntry {
     chatId: string;
