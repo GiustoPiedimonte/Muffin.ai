@@ -41,6 +41,14 @@ export const readFileToolDefinition: Anthropic.Tool = {
                 description:
                     "Relative path to the file (e.g. 'src/index.ts', 'package.json').",
             },
+            start_line: {
+                type: "number",
+                description: "Optional. 1-indexed start line to read from.",
+            },
+            end_line: {
+                type: "number",
+                description: "Optional. 1-indexed end line to read to.",
+            },
         },
         required: ["path"],
     },
@@ -110,6 +118,8 @@ export const searchFilesToolDefinition: Anthropic.Tool = {
 
 interface ReadFileInput {
     path: string;
+    start_line?: number;
+    end_line?: number;
 }
 
 export async function executeReadFile(input: ReadFileInput): Promise<string> {
@@ -124,7 +134,32 @@ export async function executeReadFile(input: ReadFileInput): Promise<string> {
             return `Error: file too large (${(info.size / 1024).toFixed(0)} KB, max ${MAX_FILE_SIZE / 1024} KB)`;
         }
 
-        const content = await readFile(abs, "utf-8");
+        let content = await readFile(abs, "utf-8");
+
+        const lines = content.split('\n');
+        let start = 0;
+        let end = lines.length;
+        let isTruncated = false;
+
+        if (input.start_line !== undefined) {
+            start = Math.max(0, input.start_line - 1);
+        }
+        if (input.end_line !== undefined) {
+            end = Math.min(lines.length, input.end_line);
+        }
+
+        // Auto-truncate if trying to read an entire huge file without bounds
+        if (input.start_line === undefined && input.end_line === undefined && lines.length > 500) {
+            end = 500;
+            isTruncated = true;
+        }
+
+        content = lines.slice(start, end).join('\n');
+
+        if (isTruncated) {
+            content += `\n\n... [File troncato a 500 righe. Usa i parametri start_line e end_line per leggere il resto]`;
+        }
+
         return content;
     } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);

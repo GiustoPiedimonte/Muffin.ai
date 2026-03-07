@@ -20,8 +20,10 @@ function getDb(): Firestore {
 
 /**
  * Retrieves the last N messages for a given chat.
+ * We limit this to the most recent 15 messages to save input/cache tokens,
+ * relying on the background compression summary for older context.
  */
-export async function getHistory(chatId: string): Promise<Message[]> {
+export async function getHistory(chatId: string, limit = 15): Promise<Message[]> {
     const doc = await getDb()
         .collection("conversations")
         .doc(chatId)
@@ -30,7 +32,10 @@ export async function getHistory(chatId: string): Promise<Message[]> {
     if (!doc.exists) return [];
 
     const data = doc.data() as ConversationDoc | undefined;
-    return data?.messages ?? [];
+    const allMessages = data?.messages ?? [];
+
+    // Return only the most recent 'limit' messages
+    return allMessages.slice(-limit);
 }
 
 /**

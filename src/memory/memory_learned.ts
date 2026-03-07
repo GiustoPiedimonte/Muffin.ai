@@ -19,6 +19,29 @@ export interface LearnedFact {
 }
 
 // ---------------------------------------------------------------------------
+// Cache
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+interface CacheEntry {
+    facts: LearnedFact[];
+    loadedAt: number;
+}
+
+const cache = new Map<string, CacheEntry>();
+
+function isCacheValid(chatId: string): boolean {
+    const entry = cache.get(chatId);
+    if (!entry) return false;
+    return Date.now() - entry.loadedAt < CACHE_TTL_MS;
+}
+
+function invalidateCache(chatId: string): void {
+    cache.delete(chatId);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -26,6 +49,23 @@ let db: Firestore;
 function getDb(): Firestore {
     if (!db) db = getFirestore();
     return db;
+}
+
+/**
+ * Simple keyword similarity: measures overlap between query and text.
+ * Returns value between 0 and 1.
+ */
+function keywordSimilarity(query: string, text: string): number {
+    const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    const textWords = text.toLowerCase().split(/\s+/);
+
+    if (queryWords.length === 0) return 0;
+
+    const matches = queryWords.filter(qw =>
+        textWords.some(tw => tw.includes(qw) || qw.includes(tw))
+    );
+
+    return matches.length / queryWords.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +100,7 @@ export async function saveLearned(
         chatId,
     });
 
+    invalidateCache(chatId);
     invalidateContextCache(chatId);
     return docRef.id;
 }
@@ -79,6 +120,7 @@ export async function confirmLearned(factId: string): Promise<void> {
     });
 
     if (chatId) {
+        invalidateCache(chatId);
         invalidateContextCache(chatId);
     }
 }
@@ -95,6 +137,7 @@ export async function rejectLearned(factId: string): Promise<void> {
     await docRef.delete();
 
     if (chatId) {
+        invalidateCache(chatId);
         invalidateContextCache(chatId);
     }
 }
@@ -103,6 +146,10 @@ export async function rejectLearned(factId: string): Promise<void> {
  * Gets all learned facts for a chat.
  */
 export async function getLearnedFacts(chatId: string): Promise<LearnedFact[]> {
+    if (isCacheValid(chatId)) {
+        return cache.get(chatId)!.facts;
+    }
+
     const snap = await getDb()
         .collection("memory_learned")
         .where("chatId", "==", chatId)
@@ -110,6 +157,8 @@ export async function getLearnedFacts(chatId: string): Promise<LearnedFact[]> {
 
     const facts = snap.docs.map(docToLearned);
     facts.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+    cache.set(chatId, { facts, loadedAt: Date.now() });
     return facts;
 }
 
@@ -119,23 +168,19 @@ export async function getLearnedFacts(chatId: string): Promise<LearnedFact[]> {
 export async function getPendingConfirmation(
     chatId: string
 ): Promise<LearnedFact | null> {
-    const snap = await getDb()
-        .collection("memory_learned")
-        .where("chatId", "==", chatId)
-        .where("needsConfirmation", "==", true)
-        .get();
+    const facts = await getLearnedFacts(chatId);
+    const pending = facts.filter((f) => f.needsConfirmation);
 
-    if (snap.empty) return null;
+    if (pending.length === 0) return null;
 
-    const facts = snap.docs.map(docToLearned);
-    facts.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
-
-    return facts[0];
+    return pending[0];
 }
 
 /**
- * Searches learned facts by keyword similarity.
- * Returns facts with similarity score > threshold.
+ * Searches learned facts with hybrid approach:
+ * 1. Try semantic search with embeddings
+ * 2. Fallback to keyword matching if embedding missing
+ * 3. Save computed embeddings to Firestore for future use
  */
 export async function searchLearned(
     chatId: string,
@@ -145,25 +190,61 @@ export async function searchLearned(
     const all = await getLearnedFacts(chatId);
     if (all.length === 0) return [];
 
+    let queryVec: number[] | null = null;
     try {
-        const queryVec = await getEmbedding(query);
-        const scored = all.map((f) => {
-            // Use stored embedding if available, skip if not
-            if (!f.embedding) return { fact: f, score: 0 };
-            return {
-                fact: f,
-                score: cosineSimilarity(queryVec, f.embedding),
-            };
-        });
-
-        return scored
-            .filter((item) => item.score > threshold)
-            .sort((a, b) => b.score - a.score)
-            .map((item) => item.fact);
+        queryVec = await getEmbedding(query, "query");
     } catch (err) {
-        console.error("searchLearned embedding failed:", err);
-        return [];
+        console.error("searchLearned: Failed to compute query embedding:", err);
+        // Continue with keyword matching fallback
     }
+
+    const scored = await Promise.all(
+        all.map(async (f) => {
+            let embedding = f.embedding;
+
+            // If embedding is missing, try to compute it
+            if (!embedding && queryVec) {
+                try {
+                    embedding = await getEmbedding(f.learnedFact);
+                    // Save the computed embedding to Firestore for future use
+                    if (f.id) {
+                        await getDb()
+                            .collection("memory_learned")
+                            .doc(f.id)
+                            .update({ embedding })
+                            .catch((err) =>
+                                console.warn(
+                                    `Failed to save computed embedding for fact ${f.id}:`,
+                                    err
+                                )
+                            );
+                    }
+                } catch (err) {
+                    console.warn(
+                        `Failed to compute embedding for fact "${f.learnedFact.substring(0, 30)}...":`,
+                        err
+                    );
+                    // Fall through to keyword matching
+                }
+            }
+
+            // Compute score based on what we have
+            let score = 0;
+            if (embedding && queryVec) {
+                score = cosineSimilarity(queryVec, embedding);
+            } else {
+                // Fallback to keyword similarity
+                score = keywordSimilarity(query, f.learnedFact);
+            }
+
+            return { fact: f, score };
+        })
+    );
+
+    return scored
+        .filter((item) => item.score > threshold)
+        .sort((a, b) => b.score - a.score)
+        .map((item) => item.fact);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,5 @@
 import { buildSemanticContext } from "./memory_semantic.js";
 import { searchLearned, type LearnedFact } from "./memory_learned.js";
-import { getRecentEpisodes, getLastEpisodeTimestamp } from "./memory_episodic.js";
 import { getMemorySummary } from "./memory_compression.js";
 
 // ---------------------------------------------------------------------------
@@ -8,8 +7,7 @@ import { getMemorySummary } from "./memory_compression.js";
 // ---------------------------------------------------------------------------
 
 const GAP_THRESHOLD_MS = 6 * 60 * 60 * 1000; // 6 hours
-const MAX_LEARNED_IN_CONTEXT = 10;
-const MAX_EPISODES_IN_CONTEXT = 6;
+const MAX_LEARNED_IN_CONTEXT = 5;
 
 // ---------------------------------------------------------------------------
 // Main retrieval function
@@ -23,31 +21,30 @@ const MAX_EPISODES_IN_CONTEXT = 6;
  *
  * Conditionally includes:
  * 2. Learned facts matching the current message (similarity search)
- * 3. Recent episodes (always, but quantity varies by time gap)
  */
 export async function getRelevantContext(
     chatId: string,
     userMessage: string
-): Promise<string> {
-    const parts: string[] = [];
+): Promise<{ staticCtx: string; dynamicCtx: string }> {
+    // Fetch all parts in parallel to reduce absolute wait time
+    const [semanticCtx, summaryCtx, learnedCtx] = await Promise.all([
+        buildSemanticContext(chatId),
+        getMemorySummary(chatId),
+        buildLearnedContext(chatId, userMessage)
+    ]);
+
+    const staticParts: string[] = [];
 
     // 1. Semantic facts — always loaded
-    const semanticCtx = await buildSemanticContext(chatId);
-    if (semanticCtx) parts.push(semanticCtx);
+    if (semanticCtx) staticParts.push(semanticCtx);
 
     // 2. Compressed historical memory summary if exists
-    const summaryCtx = await getMemorySummary(chatId);
-    if (summaryCtx) parts.push(`\n\n## Riassunto Storico\n${summaryCtx}`);
+    if (summaryCtx) staticParts.push(`\n\n## Riassunto Storico\n${summaryCtx}`);
 
-    // 3. Learned facts — filtered by relevance to current message
-    const learnedCtx = await buildLearnedContext(chatId, userMessage);
-    if (learnedCtx) parts.push(learnedCtx);
+    // Dynamic context that goes near the user message (or system block)
+    const dynamicCtx = learnedCtx ? learnedCtx : "";
 
-    // 4. Recent episodes — always included, but quantity varies by time gap
-    const episodicCtx = await buildEpisodicContext(chatId);
-    if (episodicCtx) parts.push(episodicCtx);
-
-    return parts.join("\n");
+    return { staticCtx: staticParts.join("\n"), dynamicCtx };
 }
 
 // ---------------------------------------------------------------------------
@@ -58,7 +55,7 @@ async function buildLearnedContext(
     chatId: string,
     userMessage: string
 ): Promise<string> {
-    const relevant = await searchLearned(chatId, userMessage, 0.25);
+    const relevant = await searchLearned(chatId, userMessage, 0.40);
     if (relevant.length === 0) return "";
 
     const top = relevant.slice(0, MAX_LEARNED_IN_CONTEXT);
@@ -67,28 +64,4 @@ async function buildLearnedContext(
         .join("\n");
 
     return `\n\n## Cose che ho imparato di recente\n${lines}`;
-}
-
-async function buildEpisodicContext(chatId: string): Promise<string> {
-    // Determine time gap — vary episode count based on recency
-    const lastTimestamp = await getLastEpisodeTimestamp(chatId);
-    const gap = lastTimestamp ? Date.now() - lastTimestamp.getTime() : null;
-    const isRecent = gap !== null && gap < GAP_THRESHOLD_MS;
-
-    // Always include episodes, but vary quantity based on time gap
-    const episodeCount = isRecent ? 3 : MAX_EPISODES_IN_CONTEXT;
-    const episodes = await getRecentEpisodes(chatId, episodeCount);
-    if (episodes.length === 0) return "";
-
-    const lines = episodes
-        .map((e) => {
-            const who = e.direction === "user" ? "Giusto" : "Muffin";
-            return `- ${who}: ${e.contentParaphrased}`;
-        })
-        .join("\n");
-
-    const header = isRecent
-        ? "## Ultimi messaggi\n"
-        : "## Riassunto conversazione recente\n";
-    return `\n\n${header}${lines}`;
 }
