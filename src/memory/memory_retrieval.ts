@@ -1,6 +1,7 @@
 import { buildSemanticContext } from "./memory_semantic.js";
 import { searchLearned, type LearnedFact } from "./memory_learned.js";
 import { getMemorySummary } from "./memory_compression.js";
+import { buildNarrativeContext } from "./memory_narratives.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -27,10 +28,11 @@ export async function getRelevantContext(
     userMessage: string
 ): Promise<{ staticCtx: string; dynamicCtx: string }> {
     // Fetch all parts in parallel to reduce absolute wait time
-    const [semanticCtx, summaryCtx, learnedCtx] = await Promise.all([
+    const [semanticCtx, summaryCtx, learnedCtx, narrativeCtx] = await Promise.all([
         buildSemanticContext(chatId),
         getMemorySummary(chatId),
-        buildLearnedContext(chatId, userMessage)
+        buildLearnedContext(chatId, userMessage),
+        buildNarrativeContext(chatId, userMessage)
     ]);
 
     const staticParts: string[] = [];
@@ -42,7 +44,10 @@ export async function getRelevantContext(
     if (summaryCtx) staticParts.push(`\n\n## Riassunto Storico\n${summaryCtx}`);
 
     // Dynamic context that goes near the user message (or system block)
-    const dynamicCtx = learnedCtx ? learnedCtx : "";
+    const dynamicParts: string[] = [];
+    if (learnedCtx) dynamicParts.push(learnedCtx);
+    if (narrativeCtx) dynamicParts.push(narrativeCtx);
+    const dynamicCtx = dynamicParts.join("\n");
 
     return { staticCtx: staticParts.join("\n"), dynamicCtx };
 }
