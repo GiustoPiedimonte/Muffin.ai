@@ -42,6 +42,32 @@ function getClaude(): Anthropic {
     return claude;
 }
 
+/**
+ * Creates messages with automatic retries for 'overloaded_error'.
+ */
+async function createMessagesWithRetry(params: Anthropic.MessageCreateParamsNonStreaming, maxRetries = 3): Promise<Anthropic.Message> {
+    const client = getClaude();
+    let attempt = 0;
+
+    while (attempt < maxRetries) {
+        try {
+            return await client.messages.create(params);
+        } catch (err: any) {
+            const isOverloaded = err?.error?.error?.type === 'overloaded_error' || err?.status === 529 || err?.status === 429;
+
+            if (isOverloaded && attempt < maxRetries - 1) {
+                attempt++;
+                const delay = Math.pow(2, attempt) * 1000; // 2s, 4s...
+                console.warn(`Claude API overloaded. Retrying attempt ${attempt + 1}/${maxRetries} in ${delay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+            throw err;
+        }
+    }
+    throw new Error('Max retries exceeded for Claude API');
+}
+
 // ---------------------------------------------------------------------------
 // Claude API Wrapper
 // ---------------------------------------------------------------------------
@@ -114,7 +140,7 @@ async function callClaude(
 
     if (onStatusUpdate) onStatusUpdate("⏳ Sto elaborando...");
 
-    let response = await client.messages.create({
+    let response = await createMessagesWithRetry({
         model: MODEL,
         max_tokens: 4096,
         system: systemBlocks,
@@ -153,7 +179,7 @@ async function callClaude(
 
         if (onStatusUpdate) onStatusUpdate("⏳ Sto elaborando i risultati...");
 
-        response = await client.messages.create({
+        response = await createMessagesWithRetry({
             model: MODEL,
             max_tokens: 4096,
             system: systemBlocks,
