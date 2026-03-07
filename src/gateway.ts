@@ -6,6 +6,7 @@ import { checkExplicitMemory, saveExplicitFact } from "./memory/memory_semantic.
 import { getRelevantContext } from "./memory/memory_retrieval.js";
 import { processLearnings, formatLearningResponse, handlePendingConfirmation } from "./memory/memory_learning.js";
 import { saveEpisode } from "./memory/memory_episodic.js";
+import { processNarrative } from "./memory/memory_narratives.js";
 import { logAction } from "./logger.js";
 import { enqueue } from "./queue.js";
 import { allToolDefinitions, executeTool } from "./tools/index.js";
@@ -287,7 +288,12 @@ export async function processMessage(chatId: string, userText: string, onStatusU
         console.error('Learning processing failed:', err);
     });
 
-    // 7. Format Final Output
+    // 7. Process Narratives (fire-and-forget, non-blocking)
+    processNarrative(chatId, userText, reply).catch(err => {
+        console.error('Narrative processing failed:', err);
+    });
+
+    // 8. Format Final Output
     const fullReply = reply + tokenFooter;
 
     await logAction(chatId, "response_sent", {
