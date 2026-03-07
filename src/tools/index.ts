@@ -121,7 +121,15 @@ export const toolsRegistry: Record<string, ToolRegistryEntry> = {
  * Array of all tool definitions to pass to Claude API.
  */
 export const allToolDefinitions: Anthropic.Tool[] = Object.values(toolsRegistry).map(
-    (t) => t.definition
+    (t, index, array) => {
+        if (index === array.length - 1) {
+            return {
+                ...t.definition,
+                cache_control: { type: "ephemeral" },
+            } as Anthropic.Tool; // Cast needed as cache_control might not be natively typed in all SDK versions
+        }
+        return t.definition;
+    }
 );
 
 /**
@@ -134,7 +142,16 @@ export async function executeTool(name: string, input: any): Promise<string> {
     }
 
     try {
-        return await tool.execute(input);
+        const result = await tool.execute(input);
+
+        // Truncate excessively long outputs to prevent token exhaustion
+        const MAX_TOOL_OUTPUT_LENGTH = 12000;
+        if (result.length > MAX_TOOL_OUTPUT_LENGTH) {
+            return result.substring(0, MAX_TOOL_OUTPUT_LENGTH) +
+                `\n\n... [Output Truncated: exceeded ${MAX_TOOL_OUTPUT_LENGTH} characters. Please refine your query (e.g., use pagination or specific file paths)]`;
+        }
+
+        return result;
     } catch (error) {
         return `Error executing tool ${name}: ${error instanceof Error ? error.message : String(error)}`;
     }

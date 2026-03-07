@@ -136,8 +136,8 @@ export async function processLearnings(
         updatedFacts: [],
     };
 
-    // Skip very short messages — unlikely to contain meaningful facts
-    if (userMessage.length < 30) {
+    // Skip very short messages (e.g., "ok", "sì", "no") but allow short facts
+    if (userMessage.trim().length < 5) {
         return result;
     }
 

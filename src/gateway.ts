@@ -4,7 +4,6 @@ import { resolve } from "node:path";
 import { getHistory, saveMessages, type Message } from "./memory/memory_messages.js";
 import { checkExplicitMemory, saveExplicitFact } from "./memory/memory_semantic.js";
 import { getRelevantContext } from "./memory/memory_retrieval.js";
-import { getCachedRelevantContext } from "./memory/memory_cache.js";
 import { processLearnings, formatLearningResponse, handlePendingConfirmation } from "./memory/memory_learning.js";
 import { saveEpisode } from "./memory/memory_episodic.js";
 import { logAction } from "./logger.js";
@@ -50,30 +49,61 @@ function getClaude(): Anthropic {
 async function callClaude(
     history: Message[],
     userMessage: string,
-    chatId: string
+    chatId: string,
+    onStatusUpdate?: (text: string) => Promise<void>
 ): Promise<{ text: string; inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number; model: string }> {
     const client = getClaude();
     const basePrompt = loadSystemPrompt();
-    
-    // Use cached context instead of direct call
-    const memoryContext = await getCachedRelevantContext(
-        chatId,
-        userMessage,
-        getRelevantContext
-    );
-    
-    const system = basePrompt + memoryContext;
 
-    const routerDecision = selectModel(userMessage, history, system.length);
+    if (onStatusUpdate) onStatusUpdate("⏳ Sto analizzando il contesto...");
+
+    // Generate dynamically to ensure Semantic Vector Search is userMessage-aware
+    const { staticCtx, dynamicCtx } = await getRelevantContext(
+        chatId,
+        userMessage
+    );
+
+    const systemLength = basePrompt.length + staticCtx.length + dynamicCtx.length;
+
+    const routerDecision = selectModel(userMessage, history, systemLength);
     const MODEL = routerDecision.model;
 
-    const messages: Anthropic.MessageParam[] = [
-        ...history.map((m) => ({
-            role: m.role as "user" | "assistant",
-            content: m.content,
-        })),
-        { role: "user", content: userMessage },
+    const messages: Anthropic.MessageParam[] = history.map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+    }));
+
+    // Add cache breakpoint at the most recent history turn (before the new user message)
+    if (messages.length > 0) {
+        const lastIdx = messages.length - 1;
+        messages[lastIdx] = {
+            ...messages[lastIdx],
+            content: [
+                {
+                    type: "text",
+                    text: messages[lastIdx].content as string,
+                    cache_control: { type: "ephemeral" },
+                },
+            ],
+        };
+    }
+
+    messages.push({ role: "user", content: userMessage });
+
+    const systemBlocks: Anthropic.TextBlockParam[] = [
+        {
+            type: "text",
+            text: basePrompt + "\n" + staticCtx,
+            cache_control: { type: "ephemeral" }
+        }
     ];
+
+    if (dynamicCtx) {
+        systemBlocks.push({
+            type: "text",
+            text: dynamicCtx
+        });
+    }
 
     await logAction(chatId, "claude_call", {
         model: MODEL,
@@ -82,16 +112,12 @@ async function callClaude(
         estTokens: routerDecision.estimatedPromptTokens
     });
 
+    if (onStatusUpdate) onStatusUpdate("⏳ Sto elaborando...");
+
     let response = await client.messages.create({
         model: MODEL,
         max_tokens: 4096,
-        system: [
-            {
-                type: "text",
-                text: system,
-                cache_control: { type: "ephemeral" }
-            }
-        ],
+        system: systemBlocks,
         tools: allToolDefinitions,
         messages,
     });
@@ -110,6 +136,7 @@ async function callClaude(
 
         for (const block of assistantContent) {
             if (block.type === "tool_use") {
+                if (onStatusUpdate) onStatusUpdate(`⏳ Sto usando lo strumento: <code>${block.name}</code>...`);
                 await logAction(chatId, "tool_use", { tool: block.name, input: block.input });
 
                 const result = await executeTool(block.name, block.input);
@@ -124,16 +151,12 @@ async function callClaude(
 
         messages.push({ role: "user", content: toolResults });
 
+        if (onStatusUpdate) onStatusUpdate("⏳ Sto elaborando i risultati...");
+
         response = await client.messages.create({
             model: MODEL,
             max_tokens: 4096,
-            system: [
-                {
-                    type: "text",
-                    text: system,
-                    cache_control: { type: "ephemeral" }
-                }
-            ],
+            system: systemBlocks,
             tools: allToolDefinitions,
             messages,
         });
@@ -157,13 +180,13 @@ async function callClaude(
 
 export interface ProcessResult {
     reply: string;
-    isDocument: boolean;
 }
 
 /**
  * Handle a generic user text message, orchestrating memory, rate-limiting, Claude, and tools.
  */
-export async function processMessage(chatId: string, userText: string): Promise<ProcessResult> {
+export async function processMessage(chatId: string, userText: string, onStatusUpdate?: (text: string) => Promise<void>, onFollowUp?: (text: string) => Promise<void>): Promise<ProcessResult> {
+    const startMs = Date.now();
     await logAction(chatId, "message_received", { length: userText.length });
 
     // 1. Check for explicit memory pattern
@@ -171,7 +194,7 @@ export async function processMessage(chatId: string, userText: string): Promise<
     if (explicitFact) {
         await saveExplicitFact(chatId, explicitFact);
         await logAction(chatId, "explicit_memory_saved", { fact: explicitFact });
-        return { reply: "Salvato ✓", isDocument: false };
+        return { reply: "Salvato ✓" };
     }
 
     // 2. Check for pending memory confirmation (natural language)
@@ -182,23 +205,31 @@ export async function processMessage(chatId: string, userText: string): Promise<
             confirmed: confirmation.confirmed,
         });
         if (confirmation.confirmed) {
-            return { reply: `✓ Salvato in memoria: _${confirmation.factText}_`, isDocument: false };
+            return { reply: `✓ Salvato in memoria: _${confirmation.factText}_` };
         } else {
-            return { reply: "Ok, non lo salvo ✓", isDocument: false };
+            return { reply: "Ok, non lo salvo ✓" };
         }
     }
 
     // 3. Load history & generate response via Claude
     const history = await getHistory(chatId);
-    const { text: reply, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, model } = await enqueue(() => callClaude(history, userText, chatId));
+    const { text: reply, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, model } = await enqueue(() => callClaude(history, userText, chatId, onStatusUpdate));
+
+    const elapsedMs = Date.now() - startMs;
+    const elapsedSec = (elapsedMs / 1000).toFixed(1);
 
     const totalTokens = inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens;
-    const modelInitial = model.includes("haiku") ? "H" : model.includes("sonnet") ? "S" : "?";
+    const modelInitial = model.includes("haiku") ? "Haiku" : model.includes("sonnet") ? "Sonnet" : "Claude";
+
+    // Formatting numbers with 'k' representation
     const fmtK = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(n);
-    const cacheStr = cacheReadTokens > 0 || cacheCreationTokens > 0
-        ? ` | C:${fmtK(cacheReadTokens)}`
-        : "";
-    const tokenFooter = `\n\n> \`[ ${modelInitial} | T:${fmtK(totalTokens)} | I:${fmtK(inputTokens)} | O:${fmtK(outputTokens)}${cacheStr} ]\``;
+
+    // Hardcore Debug Footer - Iconographic but verbose
+    // [ 🤖 Haiku • ⏱️ 2.4s • 🪙 1.2k ]
+    // [ 📥 IN: 1.1k • 📤 OUT: 50 | ♻️ CR: 1.0k • 📦 CW: 0 ]
+    const topRow = `[ 🤖 ${modelInitial}  ⏱️ ${elapsedSec}s  🪙 ${fmtK(totalTokens)} ]`;
+    const bottomRow = `[ 📥 ${fmtK(inputTokens)}  📤 ${fmtK(outputTokens)}  |  ♻️ CR: ${fmtK(cacheReadTokens)}  📦 CW: ${fmtK(cacheCreationTokens)} ]`;
+    const tokenFooter = `\n\n> \`${topRow}\`\n> \`${bottomRow}\``;
 
     // 4. Save to Conversational Memory
     await saveMessages(chatId, [
@@ -211,42 +242,37 @@ export async function processMessage(chatId: string, userText: string): Promise<
         console.error("Episodic save failed:", err)
     );
 
-    // 6. Process Learnings (async, non-blocking)
-    let learningFooter = "";
-    try {
-        const learnings = await processLearnings(chatId, userText, reply);
-        learningFooter = formatLearningResponse(learnings);
+    // 6. Process Learnings (fire-and-forget, non-blocking)
+    processLearnings(chatId, userText, reply).then(async (learnings) => {
+        const followUpText = formatLearningResponse(learnings);
 
         if (learnings.savedFacts.length > 0) {
-            await logAction(chatId, "memory_saved", { facts: learnings.savedFacts });
+            await logAction(chatId, 'memory_saved', { facts: learnings.savedFacts });
         }
         if (learnings.pendingConfirmations.length > 0) {
-            await logAction(chatId, "memory_confirmation_sent", {
+            await logAction(chatId, 'memory_confirmation_sent', {
                 confirmations: learnings.pendingConfirmations.map((c) => c.text),
             });
         }
-    } catch (err) {
-        console.error("Learning processing failed:", err);
-    }
+        if (followUpText && onFollowUp) {
+            await onFollowUp(followUpText);
+        }
+    }).catch(err => {
+        console.error('Learning processing failed:', err);
+    });
 
     // 7. Format Final Output
-    // If handledSilently was true we would have returned early. Since we didn't, we might need parsing.
-    // However, the confirmation reply uses Markdown in telegram (`_${confirmation.factText}_`).
-    // Ensure all these logic branches translate well. The caller should use parse_mode: Markdown.
-
-    const fullReply = reply + tokenFooter + (learningFooter ? `\n\n${learningFooter}` : "");
-    const isDocument = fullReply.length > MAX_TELEGRAM_LENGTH;
+    const fullReply = reply + tokenFooter;
 
     await logAction(chatId, "response_sent", {
         length: reply.length,
-        type: isDocument ? "file" : "text",
+        type: "text_chunked",
         inputTokens,
         outputTokens,
         totalTokens,
     });
 
     return {
-        reply: fullReply,
-        isDocument,
+        reply: fullReply
     };
 }

@@ -1,6 +1,7 @@
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import Anthropic from "@anthropic-ai/sdk";
 import { invalidateContextCache } from "./memory_cache.js";
+import { getEmbedding, cosineSimilarity } from "./memory_embeddings.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -13,6 +14,7 @@ export interface EpisodicMessage {
     contentOriginal: string;
     contentParaphrased: string;
     topics: string[];
+    embedding?: number[];
     chatId: string;
 }
 
@@ -21,6 +23,7 @@ export interface EpisodicMessage {
 // ---------------------------------------------------------------------------
 
 const MAX_EPISODES = 20;
+const MIN_EPISODE_LENGTH = 60; // Skip messages shorter than this
 const PARAPHRASE_MODEL = "claude-haiku-4-5-20251001";
 
 const PARAPHRASE_PROMPT = `Riformula il seguente messaggio in massimo 2 frasi, mantenendo l'essenza e le informazioni chiave.
@@ -31,6 +34,46 @@ RIFORMULATO: [testo riformulato]
 TOPICS: [topic1, topic2]`;
 
 // ---------------------------------------------------------------------------
+// Cache
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+interface EpisodicCacheEntry {
+    episodes: EpisodicMessage[];
+    loadedAt: number;
+}
+
+const cache = new Map<string, EpisodicCacheEntry>();
+
+function isCacheValid(chatId: string): boolean {
+    const entry = cache.get(chatId);
+    if (!entry) return false;
+    return Date.now() - entry.loadedAt < CACHE_TTL_MS;
+}
+
+function invalidateCache(chatId: string): void {
+    cache.delete(chatId);
+}
+
+export async function loadAllEpisodes(chatId: string): Promise<EpisodicMessage[]> {
+    if (isCacheValid(chatId)) {
+        return cache.get(chatId)!.episodes;
+    }
+
+    const snap = await getDb()
+        .collection("memory_episodes")
+        .where("chatId", "==", chatId)
+        .get();
+
+    const episodes = snap.docs.map(docToEpisode);
+    episodes.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+    cache.set(chatId, { episodes, loadedAt: Date.now() });
+    return episodes;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -38,6 +81,28 @@ let db: Firestore;
 function getDb(): Firestore {
     if (!db) db = getFirestore();
     return db;
+}
+
+/**
+ * Simple keyword extraction fallback when Haiku fails to extract topics.
+ * Extracts common words (length > 2) and removes stopwords.
+ */
+function extractKeywords(text: string): string[] {
+    const stopwords = new Set([
+        "il", "la", "le", "lo", "i", "gli", "un", "una", "uno", "dei", "del", "e",
+        "che", "è", "sono", "ho", "hai", "abbiamo", "avete", "hanno", "di", "da",
+        "in", "su", "per", "con", "a", "o", "se", "non", "ma", "come", "quando",
+    ]);
+
+    const words = text
+        .toLowerCase()
+        .split(/\s+/)
+        .filter(
+            (w) => w.length > 2 && !stopwords.has(w) && /[a-z]/.test(w)
+        );
+
+    // Return unique words, limit to 3
+    return [...new Set(words)].slice(0, 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -67,9 +132,11 @@ async function paraphraseAndSave(
     text: string,
     direction: "user" | "muffin"
 ): Promise<void> {
-    // Skip very short messages — not worth paraphrasing
-    if (text.length < 40) {
-        await saveRawEpisode(chatId, text, text, [], direction);
+    // FIX 1: Skip very short messages — not worth paraphrasing
+    if (text.length < MIN_EPISODE_LENGTH) {
+        console.debug(
+            `Skipping short episode (${text.length} chars): "${text.substring(0, 40)}..."`
+        );
         return;
     }
 
@@ -87,16 +154,29 @@ async function paraphraseAndSave(
             .join("\n");
 
         const paraphrased = output.match(/RIFORMULATO:\s*(.+)/i)?.[1]?.trim() || text;
-        const topicsRaw = output.match(/TOPICS:\s*(.+)/i)?.[1]?.trim() || "";
-        const topics = topicsRaw
+        let topics = output
+            .match(/TOPICS:\s*(.+)/i)?.[1]
+            ?.trim()
             .split(",")
             .map((t) => t.trim().toLowerCase())
-            .filter((t) => t.length > 0);
+            .filter((t) => t.length > 0) || [];
+
+        // FIX 2: Fallback to keyword extraction if topics is empty
+        if (topics.length === 0) {
+            topics = extractKeywords(text);
+            if (topics.length > 0) {
+                console.debug(`Fallback topics extracted: ${topics.join(", ")}`);
+            }
+        }
 
         await saveRawEpisode(chatId, text, paraphrased, topics, direction);
-    } catch {
-        // Fallback: save without paraphrasing
-        await saveRawEpisode(chatId, text, text, [], direction);
+    } catch (err) {
+        // Fallback: save without paraphrasing, with keyword extraction
+        const fallbackTopics = extractKeywords(text);
+        console.warn(
+            `Paraphrase failed, saving raw with fallback topics: ${fallbackTopics.join(", ")}`
+        );
+        await saveRawEpisode(chatId, text, text, fallbackTopics, direction);
     }
 }
 
@@ -110,12 +190,22 @@ async function saveRawEpisode(
     const db = getDb();
     const col = db.collection("memory_episodes");
 
+    // Try to compute embedding for semantic search later
+    let embedding: number[] | undefined;
+    try {
+        embedding = await getEmbedding(paraphrased);
+    } catch (err) {
+        console.warn("Failed to compute embedding for episode:", err);
+        // Continue without embedding — semantic search will skip this one
+    }
+
     await col.add({
         timestamp: new Date(),
         direction,
         contentOriginal: original,
         contentParaphrased: paraphrased,
         topics,
+        embedding,
         chatId,
     });
 
@@ -123,6 +213,7 @@ async function saveRawEpisode(
     await trimEpisodes(chatId);
 
     // Invalidate context cache so next message reloads memory
+    invalidateCache(chatId);
     invalidateContextCache(chatId);
 }
 
@@ -163,37 +254,47 @@ export async function getRecentEpisodes(
     chatId: string,
     limit = 10
 ): Promise<EpisodicMessage[]> {
-    const snap = await getDb()
-        .collection("memory_episodes")
-        .where("chatId", "==", chatId)
-        .get();
-
-    const episodes = snap.docs.map(docToEpisode);
-    episodes.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
-
+    const episodes = await loadAllEpisodes(chatId);
     return episodes.slice(0, limit).reverse(); // chronological order
 }
 
 /**
- * Returns episodes matching a topic keyword.
+ * FIX 3: Hybrid retrieval — exact match on topics + semantic search on content.
+ * Returns episodes matching a topic keyword, with fallback to semantic similarity.
  */
 export async function getEpisodesByTopic(
     chatId: string,
-    topic: string
+    topic: string,
+    semanticThreshold = 0.6
 ): Promise<EpisodicMessage[]> {
     const topicLower = topic.toLowerCase();
 
-    // Firestore array-contains for exact match on topics array
-    const snap = await getDb()
-        .collection("memory_episodes")
-        .where("chatId", "==", chatId)
-        .where("topics", "array-contains", topicLower)
-        .get();
+    const episodes = await loadAllEpisodes(chatId);
 
-    const episodes = snap.docs.map(docToEpisode);
-    episodes.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+    // Step 1: Exact topic match
+    const exactMatches = episodes.filter((e) => e.topics.includes(topicLower));
+    if (exactMatches.length > 0) {
+        exactMatches.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+        return exactMatches.slice(0, 10);
+    }
 
-    return episodes.slice(0, 10);
+    // Step 2: Semantic search if no exact matches
+    try {
+        const queryVec = await getEmbedding(topic, "query");
+        const scored = episodes
+            .map((e) => ({
+                episode: e,
+                score: e.embedding ? cosineSimilarity(queryVec, e.embedding) : 0,
+            }))
+            .filter((item) => item.score > semanticThreshold)
+            .sort((a, b) => b.score - a.score);
+
+        return scored.slice(0, 10).map((item) => item.episode);
+    } catch (err) {
+        console.warn(`Semantic search for topic "${topic}" failed:`, err);
+        // Fallback: empty result
+        return [];
+    }
 }
 
 /**
@@ -202,20 +303,11 @@ export async function getEpisodesByTopic(
 export async function getLastEpisodeTimestamp(
     chatId: string
 ): Promise<Date | null> {
-    const snap = await getDb()
-        .collection("memory_episodes")
-        .where("chatId", "==", chatId)
-        .get();
+    const episodes = await loadAllEpisodes(chatId);
+    if (episodes.length === 0) return null;
 
-    if (snap.empty) return null;
-
-    let maxTime = 0;
-    for (const doc of snap.docs) {
-        const t = doc.data().timestamp?.toDate?.()?.getTime() ?? 0;
-        if (t > maxTime) maxTime = t;
-    }
-
-    return maxTime > 0 ? new Date(maxTime) : null;
+    // loadAllEpisodes returns sorted descending by timestamp
+    return episodes[0].timestamp;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +323,7 @@ function docToEpisode(doc: FirebaseFirestore.QueryDocumentSnapshot): EpisodicMes
         contentOriginal: d.contentOriginal,
         contentParaphrased: d.contentParaphrased,
         topics: d.topics ?? [],
+        embedding: d.embedding,
         chatId: d.chatId,
     };
 }

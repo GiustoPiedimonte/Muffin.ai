@@ -1,46 +1,43 @@
-import { pipeline, type FeatureExtractionPipeline } from "@xenova/transformers";
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+const voyageai = require("voyageai");
+const VoyageAIClient = voyageai.VoyageAIClient;
 
-// Use a lightweight, fast model for sentence embeddings
-const MODEL_ID = "Xenova/all-MiniLM-L6-v2";
+let client: any = null;
 
-let extractor: FeatureExtractionPipeline | null = null;
-let isLoading = false;
-
-/**
- * Initializes and returns the feature extraction pipeline.
- * Ensures the model is only loaded once.
- */
-async function getExtractor(): Promise<FeatureExtractionPipeline> {
-    if (extractor) return extractor;
-
-    if (isLoading) {
-        // Simple wait if initialized concurrently
-        while (isLoading) {
-            await new Promise((r) => setTimeout(r, 100));
+function getClient() {
+    if (!client) {
+        if (!process.env.VOYAGE_API_KEY) {
+            throw new Error("VOYAGE_API_KEY is missing from environment variables.");
         }
-        return extractor!;
+        client = new VoyageAIClient({ apiKey: process.env.VOYAGE_API_KEY });
     }
-
-    isLoading = true;
-    try {
-        extractor = await pipeline("feature-extraction", MODEL_ID, {
-            quantized: true, // Use quantized model for faster CPU inference
-        });
-        return extractor;
-    } finally {
-        isLoading = false;
-    }
+    return client;
 }
 
 /**
  * Computes the embedding vector for the given text.
+ * @param text The text to embed.
+ * @param inputType "document" for saved facts/memories, "query" for search queries. Defaults to "document".
  */
-export async function getEmbedding(text: string): Promise<number[]> {
-    const ext = await getExtractor();
-    const output = await ext(text, { pooling: "mean", normalize: true });
+export async function getEmbedding(
+    text: string,
+    inputType: "document" | "query" = "document"
+): Promise<number[]> {
+    const voyageClient = getClient();
 
-    // Output data is a Float32Array
-    return Array.from(output.data as Float32Array);
+    const response = await voyageClient.embed({
+        input: [text],
+        model: "voyage-3.5-lite",
+        inputType: inputType,
+    });
+
+    const embedding = response.data?.[0]?.embedding;
+    if (!embedding) {
+        throw new Error("Failed to receive embedding from Voyage AI");
+    }
+
+    return embedding;
 }
 
 /**
